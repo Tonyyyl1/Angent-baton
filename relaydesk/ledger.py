@@ -1,0 +1,431 @@
+"""Ledger storage for relay-desk: load/save, normalisation, locking, device detection.
+
+Normalisation mirrors normConfig / normProject / defaultConfig in relay-desk.html.
+Unknown fields are always preserved.
+"""
+import copy
+import json
+import os
+import platform
+import secrets
+import socket
+import string
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+APP = "relaydesk"
+VERSION = 1
+
+LOCK_WAIT = 5.0    # seconds to wait for the lock
+LOCK_STALE = 30.0  # a lock file older than this is considered left over
+
+
+class LedgerError(Exception):
+    """Ledger file cannot be read, written or locked (CLI exit code 2)."""
+
+
+def tool_dir():
+    return Path(__file__).resolve().parent.parent
+
+
+# ---------------------------------------------------------------- normalisation
+
+def default_config():
+    return {
+        "devices": [
+            {"id": "a", "name": "设备 A", "os": "windows", "drop": "", "host": ""},
+            {"id": "b", "name": "设备 B", "os": "mac", "drop": "", "host": ""},
+        ],
+        "reg": {},
+    }
+
+
+def norm_config(c):
+    d = default_config()
+    c = c if isinstance(c, dict) else {}
+    out = dict(c)
+    devs = c.get("devices")
+    if isinstance(devs, list) and len(devs) == 2:
+        merged = []
+        for i, x in enumerate(devs):
+            m = dict(d["devices"][i])
+            if isinstance(x, dict):
+                m.update(x)
+            merged.append(m)
+        out["devices"] = merged
+    else:
+        out["devices"] = d["devices"]
+    reg = c.get("reg")
+    out["reg"] = dict(reg) if isinstance(reg, dict) else {}
+    return out
+
+
+def _number(v):
+    """Like JS Number(v) || 0 (ints stay ints)."""
+    if isinstance(v, bool):
+        return int(v)
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0
+    if f != f:
+        return 0
+    return int(f) if f == int(f) else f
+
+
+def _dict_or_empty(v):
+    return dict(v) if isinstance(v, dict) else {}
+
+
+def norm_project(p, config):
+    p = p if isinstance(p, dict) else {}
+    devices = config["devices"]
+    n = {
+        "name": "未命名项目", "device": devices[0]["id"], "branch": "", "worktree": "",
+        "remote": "", "tool": "claude", "status": "active", "dirty": 0, "unpushed": None,
+        "lastTask": "", "nextAction": "", "note": "", "transport": "", "handoff": None,
+        "updatedAt": "", "updatedOn": "",
+    }
+    n.update(p)
+    n["paths"] = _dict_or_empty(p.get("paths"))
+    v = {"state": "none", "cmd": "", "note": ""}
+    v.update(_dict_or_empty(p.get("verify")))
+    n["verify"] = v
+    n["reg"] = _dict_or_empty(p.get("reg"))
+    for k in ("sessions", "conflicts", "history"):
+        n[k] = list(p[k]) if isinstance(p.get(k), list) else []
+    n["dirty"] = _number(n.get("dirty"))
+    if not any(d["id"] == n["device"] for d in devices):
+        n["device"] = devices[0]["id"]
+    return n
+
+
+def _normalize(data):
+    config = norm_config(data.get("config"))
+    projects = []
+    for p in data.get("projects") or []:
+        if not isinstance(p, dict):
+            raise LedgerError("台账里的项目条目不是对象，文件可能已损坏。")
+        if not p.get("id"):
+            p = dict(p)
+            p["id"] = new_id("p_")
+        projects.append(norm_project(p, config))
+    out = {"app": APP, "version": data.get("version", VERSION), "config": config, "projects": projects}
+    for k, v in data.items():
+        if k not in out and k != "app":
+            out[k] = v
+    return out
+
+
+# ---------------------------------------------------------------- file access
+
+def load(path):
+    path = Path(path)
+    if not path.exists():
+        return _normalize({"projects": []})
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (ValueError, UnicodeDecodeError) as e:
+        raise LedgerError("台账文件不是有效的 JSON：%s（%s）" % (path, e))
+    except OSError as e:
+        raise LedgerError("读不了台账文件 %s：%s" % (path, e))
+    if not isinstance(data, dict):
+        raise LedgerError("台账文件格式不对（顶层不是对象）：%s" % path)
+    if not isinstance(data.get("projects", []), list):
+        raise LedgerError("台账文件格式不对（projects 不是列表）：%s" % path)
+    return _normalize(data)
+
+
+def save(path, ledger):
+    path = Path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".ledger-", suffix=".tmp")
+    except OSError as e:
+        raise LedgerError("写不了台账文件 %s：%s" % (path, e))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(ledger, f, ensure_ascii=False, indent=1)
+            f.write("\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        last = None
+        for _ in range(20):
+            try:
+                os.replace(tmp, str(path))
+                last = None
+                break
+            except PermissionError as e:  # Windows: target briefly held open by a reader
+                last = e
+                time.sleep(0.05)
+        if last is not None:
+            raise last
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise LedgerError("写不了台账文件 %s：%s" % (path, e))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class _Lock(object):
+    def __init__(self, path):
+        self.lock_path = str(path) + ".lock"
+        self.fd = None
+
+    def __enter__(self):
+        parent = os.path.dirname(os.path.abspath(self.lock_path))
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            raise LedgerError("无法创建台账目录 %s：%s" % (parent, e))
+        start = time.time()
+        while True:
+            try:
+                self.fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                try:
+                    os.write(self.fd, str(os.getpid()).encode("ascii"))
+                except OSError:
+                    pass
+                return self
+            except (FileExistsError, PermissionError):
+                try:
+                    age = time.time() - os.stat(self.lock_path).st_mtime
+                except OSError:
+                    continue  # vanished between the two calls: retry at once
+                if age > LOCK_STALE:
+                    try:
+                        os.remove(self.lock_path)
+                    except OSError:
+                        pass
+                    continue
+                if time.time() - start >= LOCK_WAIT:
+                    raise LedgerError("台账正被另一个进程占用（锁文件 %s）。稍后再试。" % self.lock_path)
+                time.sleep(0.05)
+            except OSError as e:
+                raise LedgerError("无法创建锁文件 %s：%s" % (self.lock_path, e))
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+        try:
+            os.remove(self.lock_path)
+        except OSError:
+            pass
+        return False
+
+
+def update(path, fn):
+    """Lock, load, apply fn(ledger) in place, save, unlock. Returns the saved ledger."""
+    with _Lock(path):
+        ledger = load(path)
+        fn(ledger)
+        ledger = _normalize(ledger)
+        save(path, ledger)
+        return ledger
+
+
+def rev(path):
+    try:
+        st = os.stat(str(path))
+    except OSError:
+        return "0"
+    return "%d-%d" % (st.st_mtime_ns, st.st_size)
+
+
+# ---------------------------------------------------------------- lookup helpers
+
+def _norm_path(p):
+    return os.path.normcase(os.path.abspath(p))
+
+
+def _project_dirs(p):
+    out = []
+    for v in (p.get("paths") or {}).values():
+        if isinstance(v, str) and v:
+            out.append(v)
+    for lst in (p.get("altPaths") or {}).values():
+        if isinstance(lst, list):
+            out.extend(x for x in lst if isinstance(x, str) and x)
+    return out
+
+
+def _inside(child, parent):
+    child, parent = _norm_path(child), _norm_path(parent)
+    if child == parent:
+        return True
+    sep = os.sep
+    return child.startswith(parent.rstrip(sep) + sep)
+
+
+def find_project(ledger, key=None, cwd=None):
+    projects = ledger.get("projects") or []
+    names = ", ".join(p.get("id", "") for p in projects)
+    if key:
+        k = key.strip()
+        kl = k.lower()
+        for p in projects:
+            if p.get("id") == k:
+                return p
+        by_name = [p for p in projects if str(p.get("name", "")).lower() == kl]
+        if len(by_name) == 1:
+            return by_name[0]
+        if len(by_name) > 1:
+            raise LookupError("名称「%s」对应多个项目：%s。请改用 id。" % (k, ", ".join(p["id"] for p in by_name)))
+        by_id_ci = [p for p in projects if str(p.get("id", "")).lower() == kl]
+        if len(by_id_ci) == 1:
+            return by_id_ci[0]
+        pref = [p for p in projects
+                if str(p.get("id", "")).lower().startswith(kl) or str(p.get("name", "")).lower().startswith(kl)]
+        if len(pref) == 1:
+            return pref[0]
+        if len(pref) > 1:
+            raise LookupError("「%s」匹配到多个项目：%s。请写得更完整一些。" % (k, ", ".join(p["id"] for p in pref)))
+        if not projects:
+            raise LookupError("找不到项目「%s」：台账里还没有项目，先用 add 登记一个。" % k)
+        raise LookupError("找不到项目「%s」。已有项目：%s。" % (k, names))
+    cwd = cwd or os.getcwd()
+    best, best_len = None, -1
+    for p in projects:
+        for d in _project_dirs(p):
+            if _inside(cwd, d):
+                n = len(_norm_path(d))
+                if n > best_len:
+                    best, best_len = p, n
+    if best is not None:
+        return best
+    if not projects:
+        raise LookupError("台账里还没有项目，先用 add 登记一个。")
+    raise LookupError("当前目录（%s）不在任何已登记项目的路径里。请指定项目：%s。" % (cwd, names))
+
+
+def dev(config, dev_id):
+    for d in config["devices"]:
+        if d["id"] == dev_id:
+            return d
+    return config["devices"][0]
+
+
+def other(config, dev_id):
+    for d in config["devices"]:
+        if d["id"] != dev_id:
+            return d
+    return config["devices"][1]
+
+
+# ---------------------------------------------------------------- local config
+
+def local_dir():
+    env = os.environ.get("RELAY_DESK_HOME")
+    if env:
+        return Path(env)
+    return Path.home() / ".relay-desk"
+
+
+def load_local():
+    f = local_dir() / "config.json"
+    try:
+        with open(str(f), "r", encoding="utf-8-sig") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_local(d):
+    base = local_dir()
+    base.mkdir(parents=True, exist_ok=True)
+    f = base / "config.json"
+    fd, tmp = tempfile.mkstemp(dir=str(base), prefix=".config-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(d, fh, ensure_ascii=False, indent=1)
+            fh.write("\n")
+        os.replace(tmp, str(f))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def ledger_path(local=None):
+    env = os.environ.get("RELAY_DESK_LEDGER")
+    if env:
+        return Path(env)
+    local = load_local() if local is None else local
+    if local.get("ledger"):
+        return Path(local["ledger"])
+    return tool_dir() / "ledger.json"
+
+
+def hostname():
+    return socket.gethostname()
+
+
+def local_os():
+    s = platform.system().lower()
+    if s == "windows":
+        return "windows"
+    if s == "darwin":
+        return "mac"
+    return "linux"
+
+
+def here(ledger, local=None):
+    """Device id of this machine, or None."""
+    devices = ledger["config"]["devices"]
+    ids = [d["id"] for d in devices]
+    env = os.environ.get("RELAY_DESK_DEVICE")
+    if env and env in ids:
+        return env
+    local = load_local() if local is None else local
+    if local.get("device") in ids:
+        return local["device"]
+    host = hostname().lower()
+    short = host.split(".")[0]
+    for d in devices:
+        h = str(d.get("host") or "").strip().lower()
+        if h and (h == host or h == short):
+            return d["id"]
+    me = local_os()
+    match = [d for d in devices if d.get("os") == me]
+    if len(match) == 1:
+        return match[0]["id"]
+    return None
+
+
+def now_iso():
+    t = datetime.now(timezone.utc)
+    return t.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (t.microsecond // 1000)
+
+
+def touch(project, here_id):
+    project["updatedAt"] = now_iso()
+    project["updatedOn"] = here_id or ""
+
+
+def new_id(prefix):
+    alphabet = string.ascii_lowercase + string.digits
+    return prefix + "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+def clone(x):
+    return copy.deepcopy(x)

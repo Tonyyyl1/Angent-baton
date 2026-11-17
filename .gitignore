@@ -1,0 +1,24 @@
+# Local runtime ledger & locks (never commit personal project paths or session IDs)
+ledger.json
+ledger.json.lock
+.ledger-*.tmp
+*.backup.json
+
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Secrets & build artifacts
+.env
+.env.*
+dist/

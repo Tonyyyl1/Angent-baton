@@ -1,0 +1,1144 @@
+<title>双机接力工作台</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap">
+<style>
+/* 版式：顶部是两条设备跑道，中间夹着虚线围出的交接区；下面是可筛选的项目台账，
+   展开一行就能看到换设备后每样东西落在哪一级。颜色只表示恢复层级，操作按钮用墨色。 */
+:root{
+  --bg:#f1f4f2; --surface:#ffffff; --sunken:#e8edea; --ink:#13201b; --muted:#566660; --faint:#85948e;
+  --line:#d5ddd9; --line-strong:#b6c2bc;
+  --native:#0a7354; --native-bg:#dbf1e7;
+  --git:#2350bf; --git-bg:#e0e7fb;
+  --extra:#8a5100; --extra-bg:#f9ebd0;
+  --manual:#9c2859; --manual-bg:#f8dfe9;
+  --danger:#b0261e; --danger-bg:#fbe3e0;
+  --btn:#13201b; --btn-ink:#ffffff; --focus:#2350bf; --shade:rgba(10,20,16,.45);
+  --font-display:"Space Grotesk","PingFang SC","Microsoft YaHei UI","Microsoft YaHei","Noto Sans SC",sans-serif;
+  --font-body:"IBM Plex Sans","PingFang SC","Microsoft YaHei UI","Microsoft YaHei","Noto Sans SC",system-ui,sans-serif;
+  --font-mono:"IBM Plex Mono","Cascadia Mono",Consolas,Menlo,"PingFang SC","Microsoft YaHei UI",monospace;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#0d1311; --surface:#151c19; --sunken:#101714; --ink:#e3ebe7; --muted:#9babA5; --faint:#6d7e78;
+  --line:#26312d; --line-strong:#3a4842;
+  --native:#55d4a8; --native-bg:#0f3529; --git:#90aeff; --git-bg:#17254a;
+  --extra:#f0b75c; --extra-bg:#39290b; --manual:#f293ba; --manual-bg:#3d1627;
+  --danger:#ff9087; --danger-bg:#421714; --btn:#e3ebe7; --btn-ink:#0d1311; --focus:#90aeff; --shade:rgba(0,0,0,.6);
+  color-scheme:dark } }
+:root[data-theme="dark"]{
+  --bg:#0d1311; --surface:#151c19; --sunken:#101714; --ink:#e3ebe7; --muted:#9baba5; --faint:#6d7e78;
+  --line:#26312d; --line-strong:#3a4842;
+  --native:#55d4a8; --native-bg:#0f3529; --git:#90aeff; --git-bg:#17254a;
+  --extra:#f0b75c; --extra-bg:#39290b; --manual:#f293ba; --manual-bg:#3d1627;
+  --danger:#ff9087; --danger-bg:#421714; --btn:#e3ebe7; --btn-ink:#0d1311; --focus:#90aeff; --shade:rgba(0,0,0,.6);
+  color-scheme:dark }
+
+*,*::before,*::after{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font:14px/1.55 var(--font-body);-webkit-font-smoothing:antialiased}
+.wrap{max-width:1220px;margin-inline:auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:22px 72px;display:flex;flex-direction:column;gap:18px}
+h1,h2,h3,h4{margin:0;font-family:var(--font-display);text-wrap:balance;letter-spacing:-.01em;line-height:1.25}
+p{margin:0}
+code,pre,.mono{font-family:var(--font-mono);font-size:.88em}
+button,input,select,textarea{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+@media (prefers-reduced-motion:no-preference){ .prow-main,.btn,.tab,.tog,.pchip{transition:background-color .12s,border-color .12s,color .12s} }
+
+/* 控件 */
+.btn{appearance:none;border:1px solid var(--line-strong);background:var(--surface);border-radius:7px;padding:6px 12px;min-height:34px;cursor:pointer;font-weight:500;white-space:nowrap}
+.btn:hover{border-color:var(--ink)}
+.btn.primary{background:var(--btn);color:var(--btn-ink);border-color:var(--btn)}
+.btn.primary:hover{opacity:.88}
+.btn.ghost{background:transparent}
+.btn.small{min-height:28px;padding:2px 9px;font-size:12.5px}
+.btn.danger{color:var(--danger);border-color:var(--danger)}
+.btn[disabled]{opacity:.5;cursor:not-allowed}
+.inp,select.inp,textarea.inp{border:1px solid var(--line-strong);background:var(--surface);border-radius:7px;padding:6px 10px;min-height:34px;min-width:0;width:100%}
+textarea.inp{min-height:68px;resize:vertical;line-height:1.5}
+.inp.mono{font-size:12.5px}
+.tier{display:inline-flex;align-items:center;border-radius:999px;padding:1px 9px;font-size:12px;font-weight:500;white-space:nowrap}
+.tier.native,.bcol.native>header{background:var(--native-bg);color:var(--native)}
+.tier.git,.bcol.git>header{background:var(--git-bg);color:var(--git)}
+.tier.extra,.bcol.extra>header{background:var(--extra-bg);color:var(--extra)}
+.tier.manual,.bcol.manual>header{background:var(--manual-bg);color:var(--manual)}
+.chip{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line-strong);border-radius:6px;padding:0 7px;font-size:12px;white-space:nowrap;background:var(--surface)}
+.chip.solid{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.chip.warn{background:var(--extra-bg);color:var(--extra);border-color:transparent;font-weight:500}
+.chip.transit{border-style:dashed;border-color:var(--ink)}
+.muted{color:var(--muted)} .faint{color:var(--faint)}
+.lbl{font-size:11.5px;letter-spacing:.06em;color:var(--muted)}
+
+/* 页头 */
+.top{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:12px 24px}
+.brand h1{font-size:27px;font-weight:700}
+.brand p{margin-top:5px;color:var(--muted);max-width:64ch}
+.here{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.here select{width:auto}
+.sync{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:3px 10px;background:var(--surface)}
+.sync::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--faint)}
+.sync.db::before{background:var(--native)} .sync.local::before{background:var(--extra)}
+.notice{border:1px solid var(--extra);background:var(--extra-bg);color:var(--extra);border-radius:8px;padding:8px 12px}
+
+/* 跑道 */
+.track{display:grid;grid-template-columns:minmax(0,1fr) minmax(170px,230px) minmax(0,1fr);border:1px solid var(--line);border-radius:12px;background:var(--surface);overflow:hidden}
+.lane{padding:16px 18px;display:flex;flex-direction:column;gap:10px;min-width:0}
+.lane-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.lane-head h2{font-size:17px;font-weight:600;overflow-wrap:anywhere}
+.os{font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;border:1px solid var(--line-strong);border-radius:4px;padding:0 5px;color:var(--muted)}
+.lane-stats{color:var(--muted);font-size:13px;display:flex;flex-wrap:wrap;gap:2px 12px}
+.lane-stats b{color:var(--ink);font-family:var(--font-display);font-size:15px;font-variant-numeric:tabular-nums;margin-right:3px}
+.lane-chips{display:flex;flex-wrap:wrap;gap:6px}
+.pchip{appearance:none;border:1px solid var(--line-strong);background:var(--surface);border-radius:999px;padding:2px 10px;font-size:12.5px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;max-width:100%}
+.pchip:hover{border-color:var(--ink)}
+.pchip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pchip i{width:7px;height:7px;border-radius:50%;background:var(--extra);flex:none}
+.transit{border-inline:1px dashed var(--line-strong);background:var(--sunken);padding:16px 12px;display:flex;flex-direction:column;gap:8px;align-items:center;text-align:center;min-width:0}
+.transit h2{font-size:13px;font-weight:600;letter-spacing:.08em}
+.transit .pchip{border-style:dashed;border-color:var(--ink)}
+.transit p{font-size:12.5px;color:var(--muted)}
+
+/* 标签页与筛选 */
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);overflow-x:auto}
+.tab{appearance:none;border:0;background:none;padding:9px 14px;font-weight:500;color:var(--muted);border-bottom:2px solid transparent;margin-bottom:-1px;cursor:pointer;white-space:nowrap}
+.tab:hover{color:var(--ink)}
+.tab[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--ink)}
+.tab .n{font-family:var(--font-mono);font-size:11px;margin-left:5px;color:var(--faint)}
+.filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.filters .inp{width:auto;flex:0 1 150px}
+.filters #f-q{flex:1 1 200px}
+.filters .count{color:var(--muted);font-size:12.5px;margin-left:auto;font-variant-numeric:tabular-nums}
+
+/* 项目台账 */
+.plist{border:1px solid var(--line);border-radius:12px;background:var(--surface);overflow:hidden}
+.phead,.prow-main{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1.15fr) minmax(0,1.3fr) 96px minmax(0,1.2fr) minmax(0,1.35fr);gap:6px 14px;align-items:center;padding:10px 16px}
+.phead{font-size:11.5px;letter-spacing:.06em;color:var(--muted);background:var(--sunken);border-bottom:1px solid var(--line);padding-block:7px}
+.prow + .prow{border-top:1px solid var(--line)}
+.prow-main{width:100%;text-align:left;border:0;background:none;cursor:pointer}
+.prow-main:hover,.prow.open>.prow-main{background:var(--sunken)}
+.prow-main>span{min-width:0;display:flex;flex-wrap:wrap;gap:4px 6px;align-items:center}
+.p-name{flex-direction:column;align-items:flex-start!important;gap:0!important}
+.p-name b{font-weight:600;font-size:14.5px;overflow-wrap:anywhere}
+.p-name code{color:var(--muted);font-size:11.5px;overflow-wrap:anywhere}
+.p-branch code{overflow-wrap:anywhere}
+.p-next{grid-column:1/-1;color:var(--muted);font-size:13px;gap:8px!important;flex-wrap:nowrap!important;align-items:baseline!important}
+.p-next em{font-style:normal;color:var(--ink);overflow-wrap:anywhere}
+.tsum{font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.tsum.native{color:var(--native)} .tsum.git{color:var(--git)} .tsum.extra{color:var(--extra)} .tsum.manual{color:var(--manual)}
+.tsum b{font-weight:600}
+.pdetail{padding:14px 16px 22px;display:flex;flex-direction:column;gap:18px;border-top:1px dashed var(--line-strong)}
+.pd-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.pd-actions .upd{margin-left:auto;color:var(--faint);font-size:12px}
+.notes{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+.note h5{margin:0 0 3px;font:500 11.5px/1.4 var(--font-body);letter-spacing:.06em;color:var(--muted)}
+.note p{white-space:pre-wrap;overflow-wrap:anywhere}
+.sec h4{font-size:14.5px;font-weight:600;margin-bottom:8px}
+.sec h4 small{font:400 12.5px var(--font-body);color:var(--muted);margin-left:8px;letter-spacing:0}
+.board{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.bcol{border:1px solid var(--line);border-radius:10px;overflow:hidden;min-width:0}
+.bcol>header{padding:7px 12px;font-weight:600;font-size:13px;display:flex;justify-content:space-between;gap:8px}
+.bcol ul{list-style:none;margin:0;padding:10px 12px 12px;display:flex;flex-direction:column;gap:9px}
+.bcol li b{display:block;font-weight:500;overflow-wrap:anywhere}
+.bcol li span{display:block;color:var(--muted);font-size:12.5px;overflow-wrap:anywhere}
+.bcol li.fixed b{font-weight:400;color:var(--muted)}
+.foot{color:var(--muted);font-size:12.5px;max-width:78ch}
+.scroll-x{overflow-x:auto}
+table.t{border-collapse:collapse;width:100%;min-width:640px}
+table.t th{font:500 11.5px var(--font-body);letter-spacing:.06em;color:var(--muted);text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+table.t td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+table.t tr:last-child td{border-bottom:0}
+table.t td code{overflow-wrap:anywhere}
+.cell-stack{display:flex;flex-direction:column;gap:3px;align-items:flex-start}
+.tier-line{display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:12.5px}
+.reg{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px}
+.regitem{border:1px solid var(--line);border-radius:8px;padding:8px 10px;display:flex;flex-direction:column;gap:6px;min-width:0}
+.regitem .rt{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}
+.regitem .rt b{font-weight:500;overflow-wrap:anywhere}
+.regitem small{color:var(--muted);font-size:12px}
+.togs{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.tog{appearance:none;border:1px solid var(--line-strong);background:transparent;border-radius:6px;padding:1px 9px;font-size:12px;cursor:pointer;color:var(--muted)}
+.tog[aria-pressed="true"]{background:var(--ink);border-color:var(--ink);color:var(--bg)}
+.empty{padding:34px 20px;text-align:center;color:var(--muted);display:flex;flex-direction:column;gap:10px;align-items:center}
+.empty b{color:var(--ink);font-family:var(--font-display);font-size:16px}
+.list-plain{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.conf{border:1px solid var(--line);border-radius:8px;padding:9px 12px;display:flex;flex-direction:column;gap:4px}
+.conf .ch{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center}
+.conf p{overflow-wrap:anywhere;white-space:pre-wrap}
+
+/* 接力 */
+.panel{border:1px solid var(--line);border-radius:12px;background:var(--surface);padding:16px 18px;display:flex;flex-direction:column;gap:14px;min-width:0}
+.panel>h3{font-size:16px;font-weight:600}
+.panel>h3 small{font:400 12.5px var(--font-body);color:var(--muted);margin-left:8px;letter-spacing:0}
+.route{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-family:var(--font-display);font-size:17px;font-weight:600}
+.route .arrow{font-family:var(--font-mono);color:var(--muted)}
+.steps{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}
+.opts{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
+.opt{border:1px solid var(--line-strong);border-radius:8px;padding:9px 11px;display:flex;gap:9px;align-items:flex-start;cursor:pointer}
+.opt:has(input:checked){border-color:var(--ink);background:var(--sunken)}
+.opt b{display:block;font-weight:500}
+.opt small{color:var(--muted);font-size:12.5px}
+.chk{display:flex;gap:9px;align-items:flex-start;padding:6px 0;border-bottom:1px solid var(--line);cursor:pointer}
+.chk:last-of-type{border-bottom:0}
+.chk input{margin-top:3px;flex:none;width:16px;height:16px}
+.chk b{display:block;font-weight:500}
+.chk small{display:block;color:var(--muted);font-size:12.5px}
+.chk:has(input:checked) b{text-decoration:line-through;color:var(--muted)}
+.cmds{display:flex;flex-direction:column;gap:10px;min-width:0}
+.cmd{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--sunken);min-width:0}
+.cmd.remote{border-color:var(--danger)}
+.cmd-head{display:flex;align-items:center;gap:8px;padding:5px 6px 5px 12px;border-bottom:1px solid var(--line);font-size:12.5px;flex-wrap:wrap}
+.cmd-head b{font-weight:500}
+.cmd-head .btn{margin-left:auto}
+.ktag{font-size:11.5px;border-radius:4px;padding:0 6px;border:1px solid var(--line-strong);color:var(--muted)}
+.ktag.remote{background:var(--danger-bg);color:var(--danger);border-color:transparent;font-weight:500}
+.cmd pre{margin:0;padding:10px 12px;overflow-x:auto;font-size:12.5px;line-height:1.65;white-space:pre;tab-size:2}
+.cmd pre .c{color:var(--faint)}
+.callout{border:1px solid var(--line-strong);border-radius:10px;padding:11px 14px;display:flex;flex-direction:column;gap:6px;background:var(--surface)}
+.callout.secret{border-color:var(--danger);background:var(--danger-bg)}
+.callout.secret h4{color:var(--danger)}
+.callout h4{font-size:13.5px;font-weight:600}
+.callout ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:3px}
+.callout.honest{border-style:dashed;border-color:var(--ink)}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.grow{flex:1}
+.legend{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.legend>div{border:1px solid var(--line);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:5px;background:var(--surface)}
+.legend p{color:var(--muted);font-size:12.5px}
+.setgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.field{display:flex;flex-direction:column;gap:3px;min-width:0}
+.field>span{font-size:12px;color:var(--muted)}
+.field small{font-size:12px;color:var(--faint)}
+
+/* 对话框 */
+dialog{border:1px solid var(--line-strong);border-radius:12px;background:var(--surface);color:var(--ink);padding:0;width:min(720px,calc(100vw - 24px));max-height:calc(100dvh - 32px)}
+dialog::backdrop{background:var(--shade)}
+.form{display:flex;flex-direction:column;max-height:calc(100dvh - 34px)}
+.form>header,.form>footer{display:flex;align-items:center;gap:8px;padding:12px 16px}
+.form>header{border-bottom:1px solid var(--line);justify-content:space-between}
+.form>header h3{font-size:16px}
+.form>footer{border-top:1px solid var(--line);flex-wrap:wrap}
+.form-body{padding:14px 16px;overflow-y:auto;display:flex;flex-direction:column;gap:12px}
+.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.form-grid .span2{grid-column:1/-1}
+#toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--ink);color:var(--bg);border-radius:8px;padding:8px 14px;font-size:13px;z-index:30;max-width:calc(100vw - 32px)}
+
+@media (max-width:980px){
+  .phead{display:none}
+  .prow-main{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .p-name{grid-column:1/-1}
+  .notes,.board,.legend{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .steps{grid-template-columns:minmax(0,1fr)}
+}
+@media (max-width:720px){
+  .track{grid-template-columns:minmax(0,1fr)}
+  .transit{border-inline:0;border-block:1px dashed var(--line-strong)}
+  .pd-actions .upd{margin-left:0;width:100%}
+}
+@media (max-width:560px){
+  .notes,.board,.legend,.setgrid,.form-grid{grid-template-columns:minmax(0,1fr)}
+  .brand h1{font-size:23px}
+}
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <h1>双机接力工作台</h1>
+      <p>记下每个项目停在哪台设备、哪个分支、哪个 Session，换设备前后各做什么。Git 带走的是文件，原 Session 留在原设备。</p>
+    </div>
+    <div class="here">
+      <label class="lbl" for="hereSel">我现在用的是</label>
+      <select class="inp" id="hereSel" data-chg="here"></select>
+      <span class="sync" id="syncBadge">正在连接</span>
+    </div>
+  </header>
+  <div class="notice" id="notice" hidden></div>
+  <section class="track" id="track" aria-label="两台设备与交接区"></section>
+  <nav class="tabs" id="tabs" role="tablist" aria-label="视图"></nav>
+  <div class="filters" id="filters">
+    <input class="inp" type="search" id="f-q" placeholder="搜索项目名、路径或分支" aria-label="搜索项目">
+    <select class="inp" id="f-device" data-chg="filter" data-f="device" aria-label="按设备筛选"></select>
+    <select class="inp" id="f-tool" data-chg="filter" data-f="tool" aria-label="按工具筛选">
+      <option value="">全部工具</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="anti">Antigravity</option>
+    </select>
+    <select class="inp" id="f-status" data-chg="filter" data-f="status" aria-label="按状态筛选">
+      <option value="">全部状态</option><option value="active">进行中</option><option value="transit">交接中</option><option value="paused">暂停</option><option value="blocked">受阻</option><option value="done">已完成</option>
+    </select>
+    <select class="inp" id="f-dirty" data-chg="filter" data-f="dirty" aria-label="按未提交改动筛选">
+      <option value="">改动不限</option><option value="yes">有未提交改动</option><option value="no">没有未提交改动</option>
+    </select>
+    <span class="count" id="f-count"></span>
+    <button type="button" class="btn primary" data-act="newProject" id="btn-new">登记项目</button>
+  </div>
+  <main id="view"></main>
+</div>
+<dialog id="dlg" aria-label="编辑"></dialog>
+<div id="toast" role="status" aria-live="polite" hidden></div>
+
+<script>
+(() => {
+'use strict';
+const $ = (s, r) => (r || document).querySelector(s);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const clone = x => JSON.parse(JSON.stringify(x));
+const z2 = n => String(n).padStart(2, '0');
+const localDate = (d = new Date()) => d.getFullYear() + '-' + z2(d.getMonth() + 1) + '-' + z2(d.getDate());
+const rid = p => p + Math.random().toString(36).slice(2, 10);
+const getPath = (o, k) => k.split('.').reduce((a, s) => (a == null ? a : a[s]), o);
+const setPath = (o, k, v) => { const ks = k.split('.'); const last = ks.pop(); let a = o; ks.forEach(s => { if (a[s] == null || typeof a[s] !== 'object') a[s] = {}; a = a[s]; }); a[last] = v; };
+
+/* ---------- 词表 ---------- */
+const TIER = {
+  native: { label: '原生可恢复', short: '原生', desc: '工具自己把同一个 Session 原样打开，对话和上下文都在。' },
+  git: { label: '可通过 Git 同步', short: 'Git', desc: '提交后随仓库到另一台设备。带走的是文件，不含对话。' },
+  extra: { label: '需要额外同步', short: '额外', desc: '在仓库之外或没提交的东西。靠中转目录、bundle 或补丁带过去。' },
+  manual: { label: '仅能手动重建', short: '重建', desc: '带不走。到另一台设备重新登录、重启进程，或读摘要开新 Session。' }
+};
+const TIER_ORDER = ['native', 'git', 'extra', 'manual'];
+const TOOL_LABEL = { claude: 'Claude Code', codex: 'Codex', anti: 'Antigravity' };
+const TOOL = { claude: 'Claude Code', codex: 'Codex', anti: 'Antigravity', both: 'Claude Code + Codex', 'claude+anti': 'Claude Code + Antigravity', 'codex+anti': 'Codex + Antigravity', all: '三个都用' };
+const TOOL_SETS = { claude: ['claude'], codex: ['codex'], anti: ['anti'], both: ['claude', 'codex'], 'claude+anti': ['claude', 'anti'], 'codex+anti': ['codex', 'anti'], all: ['claude', 'codex', 'anti'] };
+const toolsOf = t => TOOL_SETS[t] || ['claude'];
+const STATUS = { active: '进行中', paused: '暂停', blocked: '受阻', done: '已完成' };
+const VERIFY = { none: '未验证', pass: '通过', partial: '部分通过', fail: '未通过' };
+const TRANSPORT = {
+  remote: ['推送个人 WIP 分支', '把未提交改动提交到一条个人 WIP 分支再推送。会写入远程，命令由你确认后执行；团队仓库慎用。'],
+  bundle: ['bundle 文件', '把分支和未提交改动打成一个文件放进中转目录。不碰任何远程，没有远程的项目用这个。'],
+  patch: ['补丁文件', '只把未提交改动导出成补丁。要求两台设备停在同一个提交上。'],
+  folder: ['复制整个目录', '目录不是 Git 仓库时用。整个文件夹经中转目录复制，默认排除 .env。']
+};
+const CONFLICT_KIND = { both: '两台设备都改了同一处', merge: 'Git 合并或套用冲突', instr: '指令或 Skills 版本不一致', session: 'Session 分叉', other: '其他' };
+
+const KINDS = [
+  { id: 'claudeMd', scope: 'project', tool: 'claude', label: 'CLAUDE.md', path: '<项目>/CLAUDE.md', tier: 'git', how: '项目指令。提交后随仓库到另一台设备。' },
+  { id: 'claudeLocal', scope: 'project', tool: 'claude', label: 'CLAUDE.local.md', path: '<项目>/CLAUDE.local.md', tier: 'extra', how: '个人本地指令，通常不进 Git。经中转目录复制。' },
+  { id: 'ccSkills', scope: 'project', tool: 'claude', label: '.claude/skills/', path: '<项目>/.claude/skills/', tier: 'git', how: '项目 Skills。提交后两台设备一致。' },
+  { id: 'ccSettings', scope: 'project', tool: 'claude', label: '.claude/settings.json', path: '<项目>/.claude/settings.json', tier: 'git', how: '共享的权限、hooks、启用的插件。提交前确认里面没有写死的令牌。' },
+  { id: 'ccSettingsLocal', scope: 'project', tool: 'claude', label: '.claude/settings.local.json', path: '<项目>/.claude/settings.local.json', tier: 'manual', how: '本机的权限放行记录，不提交。换设备后按提示重新放行。' },
+  { id: 'ccCmdAgents', scope: 'project', tool: 'claude', label: '.claude/commands/ 与 agents/', path: '<项目>/.claude/', tier: 'git', how: '项目内的自定义命令和子代理定义。' },
+  { id: 'ccMemory', scope: 'project', tool: 'claude', label: 'Claude Code 自动记忆', path: '~/.claude/projects/<路径编码>/memory/', tier: 'extra', how: '按项目路径存在本机。两台设备路径不同，目录名也不同，复制时要放进对应目录。' },
+  { id: 'mcpJson', scope: 'project', tool: 'shared', label: '.mcp.json', path: '<项目>/.mcp.json', tier: 'git', how: 'MCP 服务器定义可以提交。OAuth 登录和令牌在每台设备各自完成。' },
+  { id: 'agentsMd', scope: 'project', tool: 'shared', label: 'AGENTS.md', path: '<项目>/AGENTS.md', tier: 'git', how: 'Codex 与 Antigravity 共用的项目指令。提交后随仓库走。' },
+  { id: 'cxProject', scope: 'project', tool: 'codex', label: '.codex/（项目内配置）', path: '<项目>/.codex/', tier: 'git', how: '项目里放了 Codex 配置或 Skills 时提交即可。先确认里面没有令牌。' },
+  { id: 'cxWorkspace', scope: 'project', tool: 'codex', label: 'Codex 工作区与线程', path: 'Codex app · VS Code 扩展', tier: 'manual', how: '线程保存在本机 app 的数据库里。另一台设备要重新打开文件夹、开新线程。' },
+  { id: 'cxConn', scope: 'project', tool: 'codex', label: 'Codex 连接与接力信息', path: 'SSH 远程 · 云环境 · 连接器', tier: 'manual', how: '只登记名称和用途，比如哪台主机、哪个云环境。密钥和登录在每台设备各自配置。' },
+  { id: 'geminiMd', scope: 'project', tool: 'anti', label: 'GEMINI.md', path: '<项目>/GEMINI.md', tier: 'git', how: 'Antigravity 项目规则指令。提交后随仓库到另一台设备。' },
+  { id: 'agProject', scope: 'project', tool: 'anti', label: '.agents/（工作区定制）', path: '<项目>/.agents/', tier: 'git', how: 'Antigravity 项目内的 Skills、Rules、Plugins、hooks.json 与 skills.json。提交前确认无令牌。' },
+  { id: 'agWorkspace', scope: 'project', tool: 'anti', label: 'Antigravity 工作区权限与设置', path: 'Antigravity 桌面端 · IDE', tier: 'manual', how: '项目的沙盒开关、联网策略、目录放行只在本机生效，换设备后按需重新设定。' },
+  { id: 'handoffMd', scope: 'project', tool: 'shared', label: 'HANDOFF.md', path: '<项目>/HANDOFF.md', tier: 'git', how: '交接摘要。帮新 Session 接上进度，不等于恢复原 Session。' },
+  { id: 'worktree', scope: 'project', tool: 'shared', label: 'Git worktree 目录', path: 'git worktree list', tier: 'extra', how: '分支随 Git 走，worktree 目录只在本机。另一台设备用 git worktree add 重建。' },
+  { id: 'envFile', scope: 'project', tool: 'shared', label: '.env 与本地密钥', path: '<项目>/.env', tier: 'manual', how: '不同步、不提交。每台设备各自配置，来源用密码管理器。' },
+  { id: 'running', scope: 'project', tool: 'shared', label: '运行中的进程与终端', path: 'dev server · 后台任务', tier: 'manual', how: '带不走。把启动命令写进交接备注。' },
+
+  { id: 'acctSkills', scope: 'global', tool: 'claude', label: '账户下发的 Skills', path: '~/.claude/skills/synced/', tier: 'native', how: '由应用按登录账户下发到本机。换设备登录同一账户后应自动出现，第一次用时核对一遍。' },
+  { id: 'userSkills', scope: 'global', tool: 'claude', label: '个人 Skills', path: '~/.claude/skills/', tier: 'extra', how: '自己放进去的 Skills 只在本机。经中转目录复制，或放进私有 dotfiles 仓库。' },
+  { id: 'userClaudeMd', scope: 'global', tool: 'claude', label: '个人全局指令', path: '~/.claude/CLAUDE.md', tier: 'extra', how: '对所有项目生效的个人指令。经中转目录复制。' },
+  { id: 'userSettings', scope: 'global', tool: 'claude', label: 'Claude Code 个人设置', path: '~/.claude/settings.json', tier: 'extra', how: '两台设备的路径和权限可能不同。复制成副本对照合并，不直接覆盖。' },
+  { id: 'ccPlugins', scope: 'global', tool: 'claude', label: '已安装的插件', path: '~/.claude/plugins/', tier: 'manual', how: '在另一台设备重新安装。不要复制缓存目录。' },
+  { id: 'ccProjects', scope: 'global', tool: 'claude', label: '全部本地 Session 转录', path: '~/.claude/projects/', tier: 'extra', how: '--resume 和 --continue 读的就是这里。可以整目录备份；跨设备恢复是非官方做法，目录名按项目路径编码。' },
+  { id: 'ccCreds', scope: 'global', tool: 'claude', label: 'Claude 登录凭据', path: '~/.claude.json · 系统钥匙串', tier: 'manual', how: '绝不同步。每台设备各自登录。', secret: true },
+  { id: 'cxAgents', scope: 'global', tool: 'codex', label: 'Codex 全局指令', path: '~/.codex/AGENTS.md', tier: 'extra', how: '对所有项目生效的 Codex 指令。经中转目录复制。' },
+  { id: 'cxConfig', scope: 'global', tool: 'codex', label: 'Codex 配置', path: '~/.codex/config.toml', tier: 'extra', how: '可能含 MCP 令牌或本机路径。复制成副本对照合并，不直接覆盖。' },
+  { id: 'cxSkills', scope: 'global', tool: 'codex', label: 'Codex Skills', path: '~/.codex/skills/', tier: 'extra', how: '经中转目录复制。.system 目录由 Codex 自己管理，不用带。' },
+  { id: 'cxSessions', scope: 'global', tool: 'codex', label: 'Codex 本地 Session 转录', path: '~/.codex/sessions/', tier: 'extra', how: 'codex resume 读的是本机的 rollout 文件。可以备份；跨设备恢复没有官方保证。' },
+  { id: 'cxAuth', scope: 'global', tool: 'codex', label: 'Codex 登录凭据', path: '~/.codex/auth.json', tier: 'manual', how: '绝不同步。每台设备各自登录。', secret: true },
+  { id: 'cxState', scope: 'global', tool: 'codex', label: 'Codex app 本地数据库', path: '~/.codex/*.sqlite', tier: 'manual', how: '线程历史、记忆、目标都在这里。不要跨设备复制数据库文件。' },
+  { id: 'agRules', scope: 'global', tool: 'anti', label: 'Antigravity 全局规则', path: '~/.gemini/GEMINI.md', tier: 'extra', how: '对本机所有项目生效的全局规则。经中转目录复制。' },
+  { id: 'agSkills', scope: 'global', tool: 'anti', label: 'Antigravity 全局 Skills', path: '~/.gemini/config/skills/', tier: 'extra', how: '自己安装的全局 Skills。经中转目录复制，Windows 与 Mac 通用。' },
+  { id: 'agMcp', scope: 'global', tool: 'anti', label: 'Antigravity MCP 配置', path: '~/.gemini/config/mcp_config.json', tier: 'extra', how: '两台设备的命令路径可能不同，且可能含令牌。脱敏后复制成副本对照合并，不直接覆盖。' },
+  { id: 'agPlugins', scope: 'global', tool: 'anti', label: 'Antigravity 插件', path: '~/.gemini/config/plugins/', tier: 'manual', how: '市场插件在另一台设备重装；自建插件可能含绝对路径或令牌，检查脱敏后再按需复制。' },
+  { id: 'agSettings', scope: 'global', tool: 'anti', label: 'Antigravity 本机设置与权限', path: '~/.gemini/config/config.json · ~/.gemini/antigravity-cli/settings.json', tier: 'manual', how: '含本机权限放行、沙盒策略与插件开关（0600 原子写）。不要跨设备覆盖或手改。' },
+  { id: 'agBrain', scope: 'global', tool: 'anti', label: 'Antigravity 会话转录与产物', path: '~/.gemini/antigravity/brain/', tier: 'extra', how: '每个会话的 transcript.jsonl 与 Artifacts（计划、报告等）都在这里。可备份查阅；跨设备默认读摘要开新会话。' },
+  { id: 'agState', scope: 'global', tool: 'anti', label: 'Antigravity 本地会话库', path: '~/.gemini/antigravity/conversations/ · *.db', tier: 'manual', how: '会话状态与 SQLite 索引只在本机有效。不要跨设备复制数据库文件。' },
+  { id: 'agAuth', scope: 'global', tool: 'anti', label: 'Antigravity 登录凭据', path: '~/.gemini/oauth_creds.json · 系统钥匙串', tier: 'manual', how: '绝不同步。每台设备各自用 Google 账户登录。', secret: true },
+  { id: 'vscodeSync', scope: 'global', tool: 'shared', label: 'VS Code 设置与扩展', path: 'Settings Sync', tier: 'native', how: '打开 VS Code 自带的 Settings Sync，设置、快捷键、扩展列表跟着账户走。' },
+  { id: 'vscodeState', scope: 'global', tool: 'shared', label: 'VS Code 窗口现场', path: '打开的标签 · 终端 · 未保存的缓冲', tier: 'manual', how: 'Settings Sync 不包含这些。离开前保存全部文件。' }
+];
+const KIND = Object.fromEntries(KINDS.map(k => [k.id, k]));
+const GLOBAL_COPY = {
+  userSkills: { rel: ['.claude', 'skills'], dir: true, drop: 'claude-skills', xd: ['synced'] },
+  userClaudeMd: { rel: ['.claude', 'CLAUDE.md'], drop: 'claude-CLAUDE.md' },
+  userSettings: { rel: ['.claude', 'settings.json'], drop: 'claude-settings', ext: '.json', review: true },
+  cxAgents: { rel: ['.codex', 'AGENTS.md'], drop: 'codex-AGENTS.md' },
+  cxConfig: { rel: ['.codex', 'config.toml'], drop: 'codex-config', ext: '.toml', review: true },
+  cxSkills: { rel: ['.codex', 'skills'], dir: true, drop: 'codex-skills', xd: ['.system'] },
+  agRules: { rel: ['.gemini', 'GEMINI.md'], drop: 'anti-GEMINI.md' },
+  agSkills: { rel: ['.gemini', 'config', 'skills'], dir: true, drop: 'anti-skills' },
+  agMcp: { rel: ['.gemini', 'config', 'mcp_config.json'], drop: 'anti-mcp_config', ext: '.json', review: true }
+};
+const SESSION_MATRIX = [
+  ['Claude Code 本地 Session', 'native', '原样恢复', 'manual', '默认只能读摘要开新 Session。搬运转录文件属于额外同步，非官方', 'claude --continue 接最近一次，claude --resume <id> 指定某一个。两条命令都只读本机的 ~/.claude/projects。'],
+  ['Claude Code 云端 Session', 'native', '原样恢复', 'native', '原样恢复', '在 claude.ai/code 里任一设备都能打开。claude --teleport <id> 把它拉到本地终端。'],
+  ['Claude Code Remote Control', 'native', 'Session 在这里运行', 'native', '远程操作，原设备必须开着并联网', '在原设备用 claude --remote-control 启动，另一台设备从浏览器或手机接着发指令。'],
+  ['Codex 本地 Session 或线程', 'native', '原样恢复', 'manual', '默认只能读摘要开新线程。rollout 文件可以备份，跨设备恢复无保证', 'codex resume 选一个，codex resume --last 接最近一次。app 和 VS Code 扩展里从线程列表打开。'],
+  ['Codex 云端任务', 'native', '任一设备可见', 'native', '任一设备可见', '任务在云端跑，结果以分支、PR 或 diff 的形式落回仓库，再用 Git 取到本地。'],
+  ['Antigravity 本地会话（桌面端 / IDE / agy）', 'native', '原样恢复', 'manual', '默认读摘要开新会话。brain 目录（含产物与转录）可额外同步供参考，不会恢复会话库', '终端用 agy --continue 接最近一次，或 agy --conversation <id> 指定会话；桌面端与 IDE 从左侧会话列表打开。'],
+  ['HANDOFF.md 与这张台账', 'git', '摘要', 'git', '摘要，不是 Session', '让新 Session 读它来重建上下文。原对话、工具结果、推理过程都不在里面。']
+];
+
+/* ---------- 状态 ---------- */
+const S = {
+  mode: 'loading', note: '', projects: [], config: null, projectsLoaded: false,
+  here: null, view: 'projects', open: null, relayPid: null, draft: {},
+  filters: { q: '', device: '', tool: '', status: '', dirty: '' }, pending: false, cmdSeq: 0
+};
+const CMDS = {};
+function defaultConfig() { return { devices: [{ id: 'a', name: '设备 A', os: 'windows', drop: '' }, { id: 'b', name: '设备 B', os: 'mac', drop: '' }], reg: {} }; }
+function normConfig(c) {
+  const d = defaultConfig(); c = c || {};
+  const devs = Array.isArray(c.devices) && c.devices.length === 2 ? c.devices.map((x, i) => Object.assign({}, d.devices[i], x)) : d.devices;
+  return { devices: devs, reg: Object.assign({}, c.reg) };
+}
+function normProject(p) {
+  const n = Object.assign({ name: '未命名项目', device: S.config.devices[0].id, branch: '', worktree: '', remote: '', tool: 'claude', status: 'active', dirty: 0, unpushed: null, lastTask: '', nextAction: '', note: '', transport: '', handoff: null, updatedAt: '', updatedOn: '' }, p);
+  n.paths = Object.assign({}, p.paths);
+  n.verify = Object.assign({ state: 'none', cmd: '', note: '' }, p.verify);
+  n.reg = Object.assign({}, p.reg);
+  ['sessions', 'conflicts', 'history'].forEach(k => { n[k] = Array.isArray(p[k]) ? p[k] : []; });
+  n.dirty = Number(n.dirty) || 0;
+  if (!S.config.devices.some(d => d.id === n.device)) n.device = S.config.devices[0].id;
+  return n;
+}
+S.config = defaultConfig();
+
+/* ---------- 存储：有云端数据库就用它，否则退回本机浏览器 ---------- */
+const Store = (() => {
+  let db = null; const chains = {}; const LS = 'relaydesk.v1';
+  let fileRev = null, filePend = 0, fileSeq = 0, fileTimer = null;
+  const serial = (key, fn) => { const p = (chains[key] || Promise.resolve()).then(fn, fn); chains[key] = p.catch(() => {}); return p; };
+  const lsWrite = () => { try { localStorage.setItem(LS, JSON.stringify({ config: S.config, projects: S.projects })); } catch (e) { toast('这个浏览器不让保存，内容只在本次打开期间有效。'); } };
+  const fail = e => { if (S.mode === 'file') { fileRev = null; toast('没有保存：本机服务连不上了。请在终端重新运行 relay serve。'); return; } toast('没有保存：' + (e && e.code === 'invalid_argument' ? '当前账户对这份数据只有查看权限。' : e && e.code === 'quota_exceeded' ? '云端空间已满。' : '云端暂时不可用，请稍后再试。')); };
+  function startLocal() {
+    S.mode = 'local';
+    try { const d = JSON.parse(localStorage.getItem(LS) || 'null'); if (d) { S.config = normConfig(d.config); S.projects = (d.projects || []).map(normProject); } } catch (e) {}
+    S.projectsLoaded = true; pickHere(); renderAll();
+  }
+  /* 文件模式：页面由本机服务（relay serve）提供，数据是磁盘上的 ledger.json */
+  const fileReq = (method, url, body, ms) => {
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), ms || 15000);
+    const opt = { method, signal: ctl.signal, cache: 'no-store', headers: {} };
+    if (method !== 'GET') { opt.headers['X-Relay-Desk'] = '1'; opt.headers['Content-Type'] = 'application/json'; if (body !== undefined) opt.body = JSON.stringify(body); }
+    return fetch(url, opt).finally(() => clearTimeout(t));
+  };
+  const fileWrite = (key, method, url, body) => {
+    filePend++; fileSeq++;
+    return serial(key, async () => {
+      const r = await fileReq(method, url, body);
+      if (!r.ok) throw new Error('http ' + r.status);
+      await r.json().catch(() => null); fileRev = null; /* 不采用写入返回的 rev，下一次轮询重新读取，避免漏掉期间的外部改动 */
+      if (S.note) { S.note = ''; renderAll(); }
+    }).finally(() => { filePend--; fileSeq++; });
+  };
+  function fileApply(d) {
+    fileRev = d.rev == null ? null : String(d.rev);
+    S.config = normConfig(d.config); S.projects = (d.projects || []).map(normProject);
+    S.projectsLoaded = true; pickHere(); renderAll();
+  }
+  async function filePoll() {
+    if (document.hidden || filePend > 0) return;
+    const seq = fileSeq;
+    try {
+      const r = await fileReq('GET', '/api/ledger' + (fileRev == null ? '' : '?rev=' + encodeURIComponent(fileRev)), undefined, 5000);
+      if (r.status === 304) { if (S.note) { S.note = ''; renderAll(); } return; }
+      if (!r.ok) throw new Error('http ' + r.status);
+      const d = await r.json();
+      if (filePend > 0 || seq !== fileSeq) return;
+      const was = S.note; S.note = '';
+      if (fileRev != null && String(d.rev || '') === fileRev && !was) return;
+      fileApply(d);
+    } catch (e) {
+      if (!S.note) { S.note = '本机服务没有响应，现在显示的内容可能不是最新的。请在终端重新运行 relay serve。'; renderAll(); }
+    }
+  }
+  function startFile(d) {
+    S.mode = 'file'; fileApply(d);
+    if (fileTimer) clearInterval(fileTimer);
+    fileTimer = setInterval(filePoll, 3000);
+  }
+  async function init() {
+    let ns = null;
+    try { if (window.claude && typeof window.claude.use === 'function') ns = await window.claude.use('db'); } catch (e) {}
+    if (!ns) {
+      if (location.protocol === 'http:' && (location.hostname === '127.0.0.1' || location.hostname === 'localhost')) {
+        try {
+          const r = await fileReq('GET', '/api/ledger', undefined, 2000);
+          if (r.ok) { const d = await r.json(); if (d && Array.isArray(d.projects)) { startFile(d); return; } }
+        } catch (e) {}
+      }
+      startLocal(); return;
+    }
+    db = ns; S.mode = 'db'; renderAll();
+    const timer = setTimeout(() => { S.note = S.projectsLoaded ? '云端数据暂时连不上，现在显示的内容可能不是最新的。' : '云端数据暂时连不上。'; renderAll(); }, 10000);
+    db.collection('projects').onSnapshot(snap => {
+      S.projects = snap.docs.map(d => normProject(Object.assign({ id: d.id }, clone(d.data()))));
+      S.projectsLoaded = true;
+      if (!snap.metadata.fromCache) { clearTimeout(timer); S.note = ''; }
+      renderAll();
+    }, err => { clearTimeout(timer); S.projectsLoaded = true; S.note = '云端数据现在读不到，页面内容不会更新。'; renderAll(); });
+    db.doc('meta/config').onSnapshot(snap => {
+      if (snap.exists) { S.config = normConfig(clone(snap.data())); S.projects = S.projects.map(normProject); }
+      pickHere(); renderAll();
+    }, () => {});
+  }
+  function saveProject(p) {
+    const i = S.projects.findIndex(x => x.id === p.id);
+    if (i >= 0) S.projects[i] = p; else S.projects.push(p);
+    renderAll();
+    if (S.mode === 'file') { const body = clone(p); delete body.id; fileWrite('p:' + p.id, 'PUT', '/api/projects/' + encodeURIComponent(p.id), body).catch(fail); return; }
+    if (S.mode !== 'db') { lsWrite(); return; }
+    const body = clone(p); delete body.id;
+    serial('p:' + p.id, () => db.collection('projects').doc(p.id).set(body)).catch(fail);
+  }
+  function deleteProject(id) {
+    S.projects = S.projects.filter(x => x.id !== id); renderAll();
+    if (S.mode === 'file') { fileWrite('p:' + id, 'DELETE', '/api/projects/' + encodeURIComponent(id)).catch(fail); return; }
+    if (S.mode !== 'db') { lsWrite(); return; }
+    serial('p:' + id, () => db.collection('projects').doc(id).delete()).catch(fail);
+  }
+  function saveConfig() {
+    renderAll();
+    if (S.mode === 'file') { fileWrite('config', 'PUT', '/api/config', clone(S.config)).catch(fail); return; }
+    if (S.mode !== 'db') { lsWrite(); return; }
+    const body = clone(S.config);
+    serial('config', () => db.doc('meta/config').set(body)).catch(fail);
+  }
+  function replaceAll(data) {
+    const old = S.projects.map(p => p.id);
+    S.config = normConfig(data.config); S.projects = (data.projects || []).map(p => normProject(Object.assign({ id: p.id || rid('p_') }, p)));
+    if (S.mode === 'file') { renderAll(); fileWrite('ledger', 'PUT', '/api/ledger', { config: clone(S.config), projects: clone(S.projects) }).catch(fail); return; }
+    if (S.mode !== 'db') { lsWrite(); renderAll(); return; }
+    saveConfig();
+    S.projects.forEach(p => { const body = clone(p); delete body.id; serial('p:' + p.id, () => db.collection('projects').doc(p.id).set(body)).catch(fail); });
+    old.filter(id => !S.projects.some(p => p.id === id)).forEach(id => serial('p:' + id, () => db.collection('projects').doc(id).delete()).catch(fail));
+    renderAll();
+  }
+  return { init, saveProject, deleteProject, saveConfig, replaceAll };
+})();
+
+/* ---------- 设备与路径 ---------- */
+const dev = id => S.config.devices.find(d => d.id === id) || S.config.devices[0];
+const other = id => S.config.devices.find(d => d.id !== id) || S.config.devices[1];
+const isWin = d => d.os === 'windows';
+const shellOf = d => (isWin(d) ? 'PowerShell' : d.os === 'mac' ? 'zsh' : 'bash');
+const osTag = d => (isWin(d) ? 'WIN' : d.os === 'mac' ? 'MAC' : 'LINUX');
+const osSlug = d => { const o = other(d.id); const s = isWin(d) ? 'win' : d.os === 'mac' ? 'mac' : 'linux'; return o.os === d.os ? s + '-' + d.id : s; };
+const joinP = (d, base, name) => base.replace(/[\\/]+$/, '') + (isWin(d) ? '\\' : '/') + name;
+const encPath = p => String(p || '').replace(/[^A-Za-z0-9]/g, '-');
+const encOf = (p, d) => (/^</.test(p) ? `<${d.name} 上项目路径的编码>` : encPath(p));
+const homeP = (d, rel) => (isWin(d) ? '$env:USERPROFILE\\' + rel.join('\\') : '$HOME/' + rel.join('/'));
+const fileSlug = s => (String(s || '').replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'project');
+const cpFile = (d, src, dst) => (isWin(d) ? `Copy-Item "${src}" "${dst}"` : `cp "${src}" "${dst}"`);
+const mkDir = (d, p) => (isWin(d) ? `New-Item -ItemType Directory -Force "${p}" | Out-Null` : `mkdir -p "${p}"`);
+function cpDir(d, src, dst, o) {
+  o = o || {}; const xd = o.xd || [], xf = o.xf || [];
+  if (isWin(d)) return `robocopy "${src}" "${dst}" /E` + (xd.length ? ' /XD ' + xd.join(' ') : '') + (xf.length ? ' /XF ' + xf.join(' ') : '');
+  return 'rsync -a ' + xd.map(x => `--exclude "${x}/" `).join('') + xf.map(x => `--exclude "${x}" `).join('') + `"${src}/" "${dst}/"`;
+}
+function guard(d, first, rest) {
+  const ind = r => (typeof r === 'string' ? '  ' + r : r);
+  return isWin(d) ? [first, 'if ($?) {', ...rest.map(ind), '}'] : [first + ' && {', ...rest.map(ind), '}'];
+}
+function pickHere() {
+  let saved = null; try { saved = localStorage.getItem('relaydesk.here'); } catch (e) {}
+  if (saved === 'none') { S.here = null; return; }
+  if (saved && S.config.devices.some(d => d.id === saved)) { S.here = saved; return; }
+  const ua = navigator.userAgent || '';
+  const os = /Windows/i.test(ua) ? 'windows' : /Macintosh/i.test(ua) ? 'mac' : /Linux/i.test(ua) && !/Android/i.test(ua) ? 'linux' : null;
+  const hits = S.config.devices.filter(d => d.os === os);
+  S.here = hits.length === 1 ? hits[0].id : null;
+}
+const regOn = (p, k, d) => !!(p.reg[k] && p.reg[k].on && p.reg[k].on[d]);
+const fmtWhen = iso => (iso ? iso.slice(0, 10) : '');
+
+/* ---------- 恢复层级 ---------- */
+function tierBoard(p) {
+  const from = dev(p.device), to = other(p.device);
+  const B = { native: [], git: [], extra: [], manual: [] };
+  p.sessions.forEach(s => {
+    const t = TOOL_LABEL[s.tool] || 'Claude Code', name = s.title || s.sessionId || '未命名 Session';
+    if (s.kind === 'cloud') B.native.push([t + ' 云端 Session', name]);
+    else if (s.kind === 'remote') B.native.push([t + ' Remote Control', name + '。仍在 ' + dev(s.device).name + ' 上运行，那台设备要开着']);
+    else if (s.device === to.id) B.native.push([t + ' 本地 Session', name + '。本来就在 ' + to.name]);
+    else if (s.carry === 'transcript') {
+      if (s.tool === 'anti') B.extra.push(['Antigravity 本地会话的 brain 目录', name + '。搬运产物与转录供查阅，非官方做法']);
+      else B.extra.push([t + ' 本地 Session 的转录文件', name + '。搬运转录是非官方做法']);
+    }
+    else B.manual.push([t + ' 本地 Session', name + '。读摘要开新 Session']);
+  });
+  if (p.branch) {
+    if (p.remote) B.git.push(['已提交的代码', p.branch + ' → ' + p.remote + (p.unpushed > 0 ? '。还有 ' + p.unpushed + ' 个提交没推送' : '')]);
+    else B.extra.push(['已提交的代码', p.branch + '。没有远程，用 bundle 文件带过去']);
+  } else B.extra.push(['整个项目目录', '不是 Git 仓库，要整个复制']);
+  if (p.dirty > 0) B.extra.push(['未提交改动', p.dirty + ' 个文件。WIP 分支、bundle 或补丁']);
+  KINDS.filter(k => k.scope === 'project' && regOn(p, k.id, from.id)).forEach(k => {
+    const tier = k.tier === 'git' && !p.remote ? 'extra' : k.tier;
+    B[tier].push([k.label, k.tier === 'git' && !p.remote ? '已提交的部分随 bundle 文件走' : (p.reg[k.id].note || k.how)]);
+  });
+  B.manual.push(['登录状态与凭据', '每台设备各自登录', true], ['运行中的进程、终端、未保存的编辑', '离开前收尾并保存', true]);
+  return B;
+}
+function sessionTiers(s) {
+  const home = dev(s.device), oth = other(s.device);
+  if (s.kind === 'cloud') return [['两台设备', 'native', '']];
+  if (s.kind === 'remote') return [[home.name, 'native', '在这里运行'], [oth.name, 'native', '远程操作']];
+  const extraNote = s.tool === 'anti' ? '搬运 brain 目录供查阅，非官方' : '搬运转录，非官方';
+  return [[home.name, 'native', ''], [oth.name, s.carry === 'transcript' ? 'extra' : 'manual', s.carry === 'transcript' ? extraNote : '读摘要开新 Session']];
+}
+function resumeLines(p, s) {
+  const path = s.cwd || p.paths[s.device] || '';
+  const out = path ? [`cd "${path}"`] : [{ n: '先进入启动这个 Session 的目录' }];
+  if (s.kind === 'cloud') {
+    if (s.tool === 'codex') return [{ n: '在 ChatGPT 的 Codex 页面打开这个云端任务' + (s.sessionId ? '：' + s.sessionId : '') }];
+    if (s.tool === 'anti') return [{ n: '在 Antigravity 打开这个云端会话' + (s.sessionId ? '：' + s.sessionId : '') }];
+    return s.sessionId ? out.concat('claude --teleport ' + s.sessionId) : [{ n: '在 claude.ai/code 打开这个 Session' }];
+  }
+  if (s.tool === 'codex') return out.concat(s.sessionId ? 'codex resume ' + s.sessionId : 'codex resume --last', { n: '用 Codex app 或 VS Code 扩展时，从线程列表打开同名线程' });
+  if (s.tool === 'anti') return out.concat(s.sessionId ? 'agy --conversation ' + s.sessionId : 'agy --continue', { n: '用 Antigravity 桌面端或 IDE 时，从左侧会话列表打开同名会话' });
+  if (s.kind === 'remote') return out.concat('claude --remote-control');
+  return out.concat(s.sessionId ? 'claude --resume ' + s.sessionId : 'claude --continue');
+}
+
+/* ---------- 接力：清单与命令 ---------- */
+function defaultTransport(p) { return p.transport || (!p.branch ? 'folder' : p.remote ? 'remote' : 'bundle'); }
+function planFor(p) {
+  const h = p.handoff, F = dev(h.from), T = dev(h.to);
+  const miss = [];
+  const PF = p.paths[F.id] || (miss.push(F.name + ' 上的项目路径'), `<${F.name} 上的项目路径>`);
+  const PT = p.paths[T.id] || (miss.push(T.name + ' 上的项目路径'), `<${T.name} 上的项目路径>`);
+  const BR = h.branch || p.branch || 'main', WIP = 'wip/handoff-' + h.tag, base = fileSlug(p.name) + '-' + h.tag;
+  const dirty = !!h.hadDirty, tr = h.transport, remote = (String(p.remote).match(/[A-Za-z0-9._-]+/) || ['origin'])[0];
+  const extras = [];
+  if (regOn(p, 'claudeLocal', F.id)) extras.push({ k: 'local', label: 'CLAUDE.local.md' });
+  if (regOn(p, 'ccMemory', F.id)) extras.push({ k: 'memory', label: 'Claude Code 自动记忆' });
+  p.sessions.filter(s => s.device === F.id && s.kind === 'local' && s.carry === 'transcript' && s.sessionId).forEach(s => {
+    if (s.tool === 'anti') extras.push({ k: 'ag_tx', s, label: 'Antigravity brain：' + (s.title || s.sessionId) });
+    else if (s.tool !== 'codex') extras.push({ k: 'tx', s, label: '转录文件：' + (s.title || s.sessionId) });
+  });
+  const needDrop = tr !== 'remote' || extras.length > 0;
+  let DF = F.drop, DT = T.drop;
+  if (needDrop) {
+    if (!DF) { miss.push(F.name + ' 的中转目录'); DF = `<${F.name} 的中转目录>`; }
+    if (!DT) { miss.push(T.name + ' 的中转目录'); DT = `<${T.name} 的中转目录>`; }
+  }
+  const whereF = '在 ' + F.name + ' 的 ' + shellOf(F) + ' 里', whereT = '在 ' + T.name + ' 的 ' + shellOf(T) + ' 里';
+  const grep = d => (isWin(d) ? "git ls-files --others --modified --exclude-standard | Select-String -Pattern '\\.env|auth\\.json|credentials|secret|token|\\.pem|\\.key$|id_rsa'" : "git ls-files --others --modified --exclude-standard | grep -Ei '\\.env|auth\\.json|credentials|secret|token|\\.pem|\\.key$|id_rsa'");
+  const pre = [], post = [];
+  const git = tr !== 'folder';
+
+  /* 离开前 */
+  if (git) {
+    const look = [`cd "${PF}"`, 'git status --short --branch', 'git stash list', 'git worktree list'];
+    if (p.remote) look.push({ n: '下面这条列出还没推送的提交。分支没有上游时会报错，可以忽略' }, 'git log --oneline "@{u}..HEAD"');
+    pre.push({ title: '看清现状', kind: 'read', where: whereF, lines: look });
+    pre.push({ title: '凭据检查', kind: 'read', where: whereF, lines: [`cd "${PF}"`, { n: '有输出就先把这些文件加进 .gitignore 或移出仓库，再往下做' }, grep(F)] });
+  }
+  const wipLines = guard(F, 'git switch -c ' + WIP, ['git add -A', `git commit -m "WIP handoff ${h.tag} (do not merge)"`, 'git switch ' + BR]);
+  if (tr === 'remote') {
+    if (dirty) {
+      pre.push({ title: '把未提交改动停到 WIP 分支', kind: 'local', where: whereF, lines: [`cd "${PF}"`, ...wipLines, { n: '做完后本机工作区是干净的，改动在 ' + WIP + ' 上' }] });
+      pre.push({ title: '推送这条 WIP 分支', kind: 'remote', where: whereF, lines: [`cd "${PF}"`, { n: '只推这一条个人分支。不动 ' + BR + '，不用 --force' }, `git push -u ${remote} ${WIP}`] });
+    } else {
+      pre.push({ title: '推送还没推的提交', kind: 'remote', where: whereF, lines: [`cd "${PF}"`, { n: '上面看到有未推送的提交时才需要。按这个仓库的规矩来，不用 --force' }, `git push ${remote} ${BR}`] });
+    }
+  } else if (tr === 'bundle') {
+    const f = joinP(F, DF, base + '.bundle');
+    const lines = [`cd "${PF}"`];
+    if (dirty) lines.push(...wipLines);
+    lines.push(`git bundle create "${f}" ${BR}` + (dirty ? ' ' + WIP : ''), `git bundle verify "${f}"`);
+    pre.push({ title: '打成 bundle 文件', kind: 'local', where: whereF, lines });
+  } else if (tr === 'patch') {
+    const f = joinP(F, DF, base + '.patch');
+    pre.push({ title: '导出补丁', kind: 'local', where: whereF, lines: [`cd "${PF}"`, { n: '记下这条输出，它是补丁的基底提交' }, 'git rev-parse HEAD', { n: '让没跟踪的新文件也进补丁。会清掉已暂存的标记，不丢内容' }, 'git add -A -N', `git diff HEAD --binary --output="${f}"`, 'git reset -q'] });
+  } else {
+    pre.push({ title: '复制整个目录', kind: 'local', where: whereF, lines: [{ n: '默认排除 .env。中转目录是网盘时，再看一眼有没有别的密钥文件' }, cpDir(F, PF, joinP(F, DF, base), { xf: ['.env'] })] });
+  }
+  const exF = [], exT = [];
+  extras.forEach(x => {
+    if (x.k === 'local') {
+      exF.push(cpFile(F, joinP(F, PF, 'CLAUDE.local.md'), joinP(F, DF, base + '-CLAUDE.local.md')));
+      exT.push(cpFile(T, joinP(T, DT, base + '-CLAUDE.local.md'), joinP(T, PT, 'CLAUDE.local.md')));
+    } else if (x.k === 'memory') {
+      const tm = homeP(T, ['.claude', 'projects', encOf(PT, T), 'memory']);
+      exF.push(cpDir(F, homeP(F, ['.claude', 'projects', encOf(PF, F), 'memory']), joinP(F, DF, base + '-memory')));
+      exT.push({ n: '目录名是项目路径的编码：字母数字以外的字符都换成 -' }, mkDir(T, tm), cpDir(T, joinP(T, DT, base + '-memory'), tm));
+    } else if (x.k === 'ag_tx') {
+      const sid = x.s.sessionId;
+      const sd = homeP(F, ['.gemini', 'antigravity', 'brain', sid]);
+      const td = homeP(T, ['.gemini', 'antigravity', 'brain', sid]);
+      exF.push(cpDir(F, sd, joinP(F, DF, base + '-anti-brain-' + sid)));
+      exT.push({ n: '非官方做法。只搬运产物与 transcript.jsonl 供新会话查阅，不会恢复原会话索引；里面的路径仍指向 ' + F.name }, mkDir(T, td), cpDir(T, joinP(T, DT, base + '-anti-brain-' + sid), td));
+    } else {
+      const sf = homeP(F, ['.claude', 'projects', encOf(x.s.cwd || PF, F), x.s.sessionId + '.jsonl']);
+      const td = homeP(T, ['.claude', 'projects', encOf(PT, T)]);
+      exF.push(cpFile(F, sf, joinP(F, DF, x.s.sessionId + '.jsonl')));
+      exT.push({ n: '非官方做法。转录里的绝对路径仍指向 ' + F.name + '，先拿不重要的 Session 试' }, mkDir(T, td), cpFile(T, joinP(T, DT, x.s.sessionId + '.jsonl'), joinP(T, td, x.s.sessionId + '.jsonl')), `cd "${PT}"`, 'claude --resume ' + x.s.sessionId);
+    }
+  });
+  if (exF.length) pre.push({ title: '带走额外同步的文件', kind: 'local', where: whereF, lines: exF });
+
+  /* 接力后 */
+  if (git) post.push({ title: '确认这边是干净的', kind: 'read', where: whereT, lines: [`cd "${PT}"`, { n: '应当没有未提交改动。有的话先处理，见「冲突记录」里的命令' }, 'git status --short --branch'] });
+  const applyWip = ref => guard(T, 'git switch ' + BR, guard(T, `git merge --ff-only "${ref}~1"`, isWin(T) ? ['git cherry-pick -n ' + ref, 'if ($?) { git reset -q }'] : [`git cherry-pick -n ${ref} && git reset -q`]));
+  if (tr === 'remote') {
+    const ref = remote + '/' + WIP;
+    const lines = [`cd "${PT}"`, 'git fetch ' + remote];
+    if (dirty) lines.push({ n: '先把 ' + BR + ' 快进到离开时的提交，再把未提交改动套回工作区' }, ...applyWip(ref));
+    else lines.push(...guard(T, 'git switch ' + BR, ['git pull --ff-only']));
+    lines.push('git status --short --branch', { n: '提示找不到分支或有多个远程同名时：git switch -c ' + BR + ' --track ' + remote + '/' + BR });
+    post.push({ title: '取回代码' + (dirty ? '和未提交改动' : ''), kind: 'local', where: whereT, lines });
+  } else if (tr === 'bundle') {
+    const f = joinP(T, DT, base + '.bundle');
+    const lines = [`cd "${PT}"`, `git bundle verify "${f}"`, `git fetch "${f}" "refs/heads/*:refs/remotes/handoff/*"`];
+    if (dirty) lines.push(...applyWip('handoff/' + WIP)); else lines.push(...guard(T, 'git switch ' + BR, ['git merge --ff-only handoff/' + BR]));
+    lines.push('git status --short --branch', { n: T.name + ' 上还没有这个仓库时：git clone -b ' + BR + ' "' + f + '" "' + PT + '"' });
+    post.push({ title: '从 bundle 取回', kind: 'local', where: whereT, lines });
+  } else if (tr === 'patch') {
+    const f = joinP(T, DT, base + '.patch');
+    post.push({ title: '套用补丁', kind: 'local', where: whereT, lines: [`cd "${PT}"`, { n: '这条输出必须等于离开时记下的基底提交' + (h.baseCommit ? '：' + h.baseCommit : '') }, 'git rev-parse HEAD', ...guard(T, `git apply --check "${f}"`, [`git apply "${f}"`]), 'git status --short'] });
+  } else {
+    post.push({ title: '放回整个目录', kind: 'local', where: whereT, lines: [{ n: '会覆盖 ' + T.name + ' 上同名的旧文件。那边有自己的改动时先备份' }, cpDir(T, joinP(T, DT, base), PT)] });
+  }
+  if (exT.length) post.push({ title: '放回额外同步的文件', kind: 'local', where: whereT, lines: exT });
+  if (p.worktree) post.push({ title: '重建 worktree', kind: 'local', where: whereT, lines: [`cd "${PT}"`, { n: '原来在 ' + F.name + ' 的 ' + p.worktree + '。目录和分支换成这台设备上要用的' }, 'git worktree list'] });
+  const tools = toolsOf(p.tool);
+  const ctx = [`cd "${PT}"`];
+  if (tools.includes('claude')) ctx.push({ n: '这是新 Session。进入后说「接棒」，它会读 HANDOFF.md 和台账' }, 'claude');
+  if (tools.includes('codex')) ctx.push({ n: 'Codex 开新线程。说「接棒」，它会读 AGENTS.md、HANDOFF.md 和台账' }, 'codex');
+  if (tools.includes('anti')) ctx.push({ n: 'Antigravity 开新会话（桌面端、IDE 或终端 agy）。说「接棒」，它会读 GEMINI.md、AGENTS.md、HANDOFF.md 和台账' }, 'agy');
+  post.push({ title: '开新 Session 接上进度', kind: 'local', where: whereT, lines: ctx });
+  if (p.verify.cmd) post.push({ title: '重跑验证', kind: 'local', where: whereT, lines: [`cd "${PT}"`, { n: '上次结果：' + VERIFY[p.verify.state] + (p.verify.note ? '。' + p.verify.note : '') }, p.verify.cmd] });
+
+  const nSess = p.sessions.filter(s => s.device === F.id && s.kind === 'local').length;
+  const preChecks = [
+    ['stop', '让 Claude Code、Codex 和 Antigravity 停在一个完整回合', '后台任务、dev server 已结束，或者启动命令已写进交接备注。'],
+    ['summary', '让当前 Session 写下交接摘要', '对代理说「接力」，它会写 HANDOFF.md 并更新台账。Claude Code 的 handoff 插件（「交接」）还会提交并推送，不想写远程的项目不要用它。这是摘要，替代不了原 Session。'],
+    ['sessions', '核对留在 ' + F.name + ' 的 Session', '已登记 ' + nSess + ' 个本地 Session。回到这台设备时可以原样恢复，记下它们的 ID。'],
+    ['desk', '在台账里更新最近任务、下一步动作、验证结果', ''],
+    ['carry', git ? '按给出的命令带走代码' + (dirty ? (p.dirty > 0 ? '和 ' + p.dirty + ' 个未提交文件' : '和未提交改动') : '') : '按给出的命令复制整个目录', tr === 'patch' ? '补丁不会清空本机改动。接力完成后回到这台设备时先 git stash push -u，免得两边各改一份。' : ''],
+    git ? ['stash', '确认 stash 和别的 worktree 里没有落下的工作', 'stash 不随 push、bundle、补丁走。'] : null,
+    extras.length ? ['extra', '带走需要额外同步的本地状态', extras.map(x => x.label).join('、')] : null,
+    ['secrets', '确认凭据没有混进去', '.env、auth.json、令牌、私钥不在提交、bundle、补丁和中转目录里。']
+  ].filter(Boolean);
+  const postChecks = [
+    git ? ['clean', '确认 ' + T.name + ' 的工作区是干净的', '那边有自己的改动时先收起来，再套用带过来的内容。'] : null,
+    ['pull', '取回代码' + (dirty ? '和未提交改动' : ''), '按给出的命令做。出现冲突就停下，不强推、不覆盖，记一条冲突记录。'],
+    extras.length ? ['extra', '放回额外同步的文件', extras.map(x => x.label).join('、')] : null,
+    p.worktree ? ['worktree', '重建 worktree', ''] : null,
+    ['login', '确认这台设备已登录', 'Claude Code、Codex、Antigravity、MCP 连接器、SSH 密钥、.env 都在这台设备各自配置。'],
+    ['context', '接上上下文', '开新 Session，对代理说「接棒」。云端 Session 可以直接打开原来那个。'],
+    ['verify', '重跑验证，对照上次结果', '上次：' + VERIFY[p.verify.state] + (p.verify.note ? '。' + p.verify.note : '')],
+    ['desk', '在台账里更新未提交改动数和下一步动作', '']
+  ].filter(Boolean);
+  return { F, T, miss, pre, post, preChecks, postChecks, tr, dirty, WIP, BR };
+}
+
+/* ---------- 渲染 ---------- */
+function cmdBlock(b) {
+  const id = 'cmd' + (++S.cmdSeq);
+  CMDS[id] = b.lines.filter(l => typeof l === 'string').join('\n');
+  const body = b.lines.map(l => (typeof l === 'string' ? esc(l) : `<span class="c"># ${esc(l.n)}</span>`)).join('\n');
+  const tag = b.kind === 'remote' ? '<span class="ktag remote">写入远程，确认后再执行</span>' : b.kind === 'read' ? '<span class="ktag">只读</span>' : '<span class="ktag">只改本机</span>';
+  return `<div class="cmd ${b.kind === 'remote' ? 'remote' : ''}"><div class="cmd-head"><b>${esc(b.title)}</b>${tag}${b.where ? `<span class="faint">${esc(b.where)}</span>` : ''}<button type="button" class="btn small" data-act="copy" data-c="${id}" id="b-${id}">复制命令</button></div><pre id="${id}">${body}</pre></div>`;
+}
+const tierPill = (t, extra) => `<span class="tier ${t}">${TIER[t].label}${extra ? ' · ' + esc(extra) : ''}</span>`;
+const devChip = (id, solid) => `<span class="chip ${solid ? 'solid' : ''}">${esc(dev(id).name)}</span>`;
+
+function renderChrome() {
+  const sel = $('#hereSel');
+  sel.innerHTML = S.config.devices.map(d => `<option value="${esc(d.id)}">${esc(d.name)}</option>`).join('') + '<option value="none">别的设备，只查看</option>';
+  sel.value = S.here || 'none';
+  const b = $('#syncBadge');
+  b.className = 'sync ' + (S.mode === 'db' || S.mode === 'file' ? 'db' : S.mode === 'local' ? 'local' : '');
+  b.textContent = S.mode === 'file' ? '文件模式，Claude Code、Codex 和 Antigravity 共用这份台账' : S.mode === 'db' ? '云端保存，两台设备共用一份' : S.mode === 'local' ? '本地模式，只存在这个浏览器' : '正在连接';
+  const n = $('#notice'); n.hidden = !S.note; n.textContent = S.note;
+  const nConf = S.projects.reduce((a, p) => a + p.conflicts.length, 0), nRelay = S.projects.filter(p => p.handoff).length;
+  const tabs = [['projects', '项目', S.projects.length], ['relay', '接力', nRelay], ['registry', '状态登记', ''], ['conflicts', '冲突记录', nConf], ['settings', '设置', '']];
+  $('#tabs').innerHTML = tabs.map(([v, t, c]) => `<button type="button" class="tab" role="tab" id="tab-${v}" aria-selected="${S.view === v}" data-act="tab" data-v="${v}">${t}${c !== '' ? `<span class="n">${c}</span>` : ''}</button>`).join('');
+  $('#filters').hidden = S.view !== 'projects';
+  const fd = $('#f-device'), cur = S.filters.device;
+  fd.innerHTML = '<option value="">全部设备</option>' + S.config.devices.map(d => `<option value="${esc(d.id)}">在 ${esc(d.name)}</option>`).join('');
+  fd.value = cur;
+}
+
+function renderTrack() {
+  const lane = d => {
+    const ps = S.projects.filter(p => p.device === d.id && !p.handoff);
+    const dirty = S.projects.filter(p => p.device === d.id && p.dirty > 0).length;
+    const sess = S.projects.reduce((a, p) => a + p.sessions.filter(s => s.device === d.id && s.kind !== 'cloud').length, 0);
+    const all = S.projects.filter(p => p.device === d.id).length;
+    return `<div class="lane"><div class="lane-head"><span class="os">${osTag(d)}</span><h2>${esc(d.name)}</h2>${S.here === d.id ? '<span class="chip solid">本机</span>' : ''}</div>
+      <p class="lane-stats"><span><b>${all}</b>个项目在这里</span><span><b>${dirty}</b>个有未提交改动</span><span><b>${sess}</b>个本地 Session</span></p>
+      <div class="lane-chips">${ps.map(p => `<button type="button" class="pchip" data-act="open" data-id="${esc(p.id)}" title="${esc(p.name)}"><span>${esc(p.name)}</span>${p.dirty > 0 ? '<i title="有未提交改动"></i>' : ''}</button>`).join('') || '<span class="faint">' + (S.projectsLoaded ? '没有停在这里的项目' : '正在读取') + '</span>'}</div></div>`;
+  };
+  const moving = S.projects.filter(p => p.handoff);
+  const [A, B] = S.config.devices;
+  const mid = `<div class="transit"><h2>交接区</h2>${moving.map(p => `<button type="button" class="pchip" data-act="relay" data-id="${esc(p.id)}"><span>${esc(p.name)} ${p.handoff.from === A.id ? '→' : '←'}</span></button>`).join('') || '<p>没有进行中的接力</p>'}</div>`;
+  $('#track').innerHTML = lane(A) + mid + lane(B);
+}
+
+function filtered() {
+  const f = S.filters, q = f.q.trim().toLowerCase(), rank = { active: 0, blocked: 1, paused: 2, done: 3 };
+  return S.projects.filter(p => {
+    if (q && !(p.name + ' ' + Object.values(p.paths).join(' ') + ' ' + p.branch + ' ' + p.worktree).toLowerCase().includes(q)) return false;
+    if (f.device && p.device !== f.device) return false;
+    if (f.tool && !toolsOf(p.tool).includes(f.tool)) return false;
+    if (f.status === 'transit' ? !p.handoff : f.status && p.status !== f.status) return false;
+    if (f.dirty === 'yes' && !(p.dirty > 0)) return false;
+    if (f.dirty === 'no' && p.dirty > 0) return false;
+    return true;
+  }).sort((a, b) => (rank[a.status] - rank[b.status]) || String(b.updatedAt).localeCompare(String(a.updatedAt)) || a.name.localeCompare(b.name));
+}
+
+function projectRow(p) {
+  const B = tierBoard(p), open = S.open === p.id, to = other(p.device);
+  const tools = toolsOf(p.tool).map(t => `<span class="chip" title="${TOOL[t]}">${t === 'claude' ? 'CC' : t === 'codex' ? 'CX' : 'AG'}</span>`).join('');
+  const sums = TIER_ORDER.map(t => { const n = B[t].filter(x => !x[2]).length; return n ? `<span class="tsum ${t}">${TIER[t].short} <b>${n}</b></span>` : ''; }).join('');
+  const main = `<button type="button" class="prow-main" id="row-${esc(p.id)}" data-act="toggle" data-id="${esc(p.id)}" aria-expanded="${open}">
+    <span class="p-name"><b>${esc(p.name)}</b><code>${esc(p.paths[p.device] || '还没填这台设备上的路径')}</code></span>
+    <span>${devChip(p.device, S.here === p.device)}${p.handoff ? `<span class="chip transit">交接中 → ${esc(dev(p.handoff.to).name)}</span>` : ''}</span>
+    <span class="p-branch">${p.branch ? `<code>${esc(p.branch)}</code>` : '<span class="faint">不是 Git 仓库</span>'}${p.worktree ? '<span class="chip">worktree</span>' : ''}</span>
+    <span>${tools}</span>
+    <span><span class="chip">${STATUS[p.status] || p.status}</span>${p.dirty > 0 ? `<span class="chip warn">未提交 ${p.dirty}</span>` : ''}</span>
+    <span>${sums}</span>
+    <span class="p-next"><span class="lbl">下一步</span><em>${p.nextAction ? esc(p.nextAction) : '<span class="faint">还没写</span>'}</em></span>
+  </button>`;
+  return `<article class="prow ${open ? 'open' : ''}">${main}${open ? projectDetail(p, B, to) : ''}</article>`;
+}
+
+function projectDetail(p, B, to) {
+  const pid = esc(p.id), [A, Bd] = S.config.devices;
+  const note = (h, t) => `<div class="note"><h5>${h}</h5><p>${t ? esc(t) : '<span class="faint">还没写</span>'}</p></div>`;
+  const board = TIER_ORDER.map(t => `<div class="bcol ${t}"><header><span>${TIER[t].label}</span><span>${B[t].filter(x => !x[2]).length}</span></header><ul>${B[t].map(x => `<li class="${x[2] ? 'fixed' : ''}"><b>${esc(x[0])}</b><span>${esc(x[1])}</span></li>`).join('') || '<li class="fixed"><b>这一级没有东西</b></li>'}</ul></div>`).join('');
+  const sess = p.sessions.length ? `<div class="scroll-x"><table class="t"><thead><tr><th>Session</th><th>ID</th><th>能恢复到什么程度</th><th>恢复命令</th><th></th></tr></thead><tbody>${p.sessions.map(s => {
+    const lines = resumeLines(p, s), id = 'rs-' + p.id + '-' + s.id; CMDS[id] = lines.filter(l => typeof l === 'string').join('\n');
+    return `<tr><td><div class="cell-stack"><b>${esc(s.title || '未命名')}</b><span class="muted">${TOOL_LABEL[s.tool] || 'Claude Code'} · ${s.kind === 'cloud' ? '云端' : s.kind === 'remote' ? 'Remote Control' : '本地'}${s.lastUsed ? ' · ' + esc(s.lastUsed) : ''}</span>${s.note ? `<span class="muted">${esc(s.note)}</span>` : ''}</div></td>
+      <td><code>${esc(s.sessionId || '未登记')}</code></td>
+      <td><div class="cell-stack">${sessionTiers(s).map(x => `<span class="tier-line"><span class="muted">${esc(x[0])}</span>${tierPill(x[1])}${x[2] ? `<span class="muted">${esc(x[2])}</span>` : ''}</span>`).join('')}</div></td>
+      <td><div class="cell-stack">${lines.map(l => (typeof l === 'string' ? `<code>${esc(l)}</code>` : `<span class="muted">${esc(l.n)}</span>`)).join('')}${CMDS[id] ? `<button type="button" class="btn small" data-act="copy" data-c="${esc(id)}" id="b-${esc(id)}">复制命令</button>` : ''}</div></td>
+      <td><button type="button" class="btn small ghost" data-act="editSession" data-id="${pid}" data-s="${esc(s.id)}" id="es-${pid}-${esc(s.id)}">编辑</button></td></tr>`;
+  }).join('')}</tbody></table></div>` : '<p class="muted">还没有登记 Session。把还想接着用的 Session ID 记在这里，回到那台设备时一条命令就能原样打开。</p>';
+  const reg = KINDS.filter(k => k.scope === 'project').map(k => `<div class="regitem"><div class="rt"><b>${esc(k.label)}</b>${tierPill(k.tier)}</div><small>${esc(k.how)}</small><div class="togs"><span class="lbl">存在于</span>${[A, Bd].map(d => `<button type="button" class="tog" id="tg-${pid}-${k.id}-${esc(d.id)}" aria-pressed="${regOn(p, k.id, d.id)}" data-act="regTog" data-id="${pid}" data-k="${k.id}" data-d="${esc(d.id)}">${esc(d.name)}</button>`).join('')}</div></div>`).join('');
+  const conf = p.conflicts.length ? `<ul class="list-plain">${p.conflicts.map(c => conflictItem(p, c)).join('')}</ul>` : '<p class="muted">没有冲突记录。</p>';
+  return `<div class="pdetail">
+    <div class="pd-actions">
+      <button type="button" class="btn primary" data-act="relay" data-id="${pid}" id="rl-${pid}">${p.handoff ? '继续这次接力' : '接力到 ' + esc(to.name)}</button>
+      <button type="button" class="btn" data-act="editProject" data-id="${pid}" id="ep-${pid}">编辑项目</button>
+      <button type="button" class="btn" data-act="addSession" data-id="${pid}" id="as-${pid}">登记 Session</button>
+      <button type="button" class="btn" data-act="addConflict" data-id="${pid}" id="ac-${pid}">记录冲突</button>
+      <span class="upd">${p.updatedAt ? '更新于 ' + fmtWhen(p.updatedAt) + (p.updatedOn ? '，在 ' + esc(dev(p.updatedOn).name) : '') : ''}</span>
+    </div>
+    <div class="notes">${note('最近一次任务', p.lastTask)}${note('下一步动作', p.nextAction)}${note('验证结果', VERIFY[p.verify.state] + (p.verify.note ? '。' + p.verify.note : '') + (p.verify.cmd ? '\n' + p.verify.cmd : ''))}${note('交接备注', p.note)}</div>
+    <section class="sec"><h4>换到 ${esc(to.name)} 之后<small>每样东西落在哪一级</small></h4><div class="board">${board}</div>
+      <p class="foot" style="margin-top:8px">HANDOFF.md 和这张台账都是摘要。它们让新 Session 接上进度，原 Session 的对话、工具结果仍留在 ${esc(dev(p.device).name)}。</p></section>
+    <section class="sec"><h4>Session<small>${p.sessions.length} 个</small></h4>${sess}</section>
+    <section class="sec"><h4>本地状态登记<small>点设备名切换，它决定上面的分级</small></h4><div class="reg">${reg}</div></section>
+    <section class="sec"><h4>冲突处理记录<small>${p.conflicts.length} 条</small></h4>${conf}</section>
+  </div>`;
+}
+function conflictItem(p, c) {
+  return `<li class="conf"><div class="ch"><b>${esc(CONFLICT_KIND[c.kind] || c.kind)}</b><span class="muted">${esc(c.date || '')}</span>${c.device ? devChip(c.device) : ''}<span class="chip">${esc(c.kept || '尚未解决')}</span><span class="grow"></span><button type="button" class="btn small ghost" data-act="editConflict" data-id="${esc(p.id)}" data-c="${esc(c.id)}" id="ec-${esc(p.id)}-${esc(c.id)}">编辑</button></div>${c.files ? `<code>${esc(c.files)}</code>` : ''}${c.resolution ? `<p>${esc(c.resolution)}</p>` : ''}</li>`;
+}
+
+function viewProjects() {
+  const list = filtered();
+  $('#f-count').textContent = S.projectsLoaded ? '显示 ' + list.length + ' / ' + S.projects.length : '';
+  if (!S.projectsLoaded) return '<div class="plist"><div class="empty"><b>正在读取台账</b><span>从云端取回已登记的项目。</span></div></div>';
+  if (!S.projects.length) return '<div class="plist"><div class="empty"><b>还没有登记项目</b><span>点「登记项目」写下第一个：它停在哪台设备、哪个分支，用的是 Claude Code、Codex 还是 Antigravity。</span><button type="button" class="btn primary" data-act="newProject" id="btn-new2">登记项目</button></div></div>';
+  if (!list.length) return '<div class="plist"><div class="empty"><b>没有符合筛选条件的项目</b><button type="button" class="btn" data-act="clearFilters" id="btn-clear">清除筛选</button></div></div>';
+  return `<div class="plist"><div class="phead"><span>项目</span><span>所在设备</span><span>分支 / worktree</span><span>工具</span><span>状态</span><span>换设备后的分级</span></div>${list.map(projectRow).join('')}</div>`;
+}
+
+function viewRelay() {
+  const p = S.projects.find(x => x.id === S.relayPid);
+  const pick = `<div class="row"><label class="lbl" for="relaySel">项目</label><select class="inp" id="relaySel" data-chg="relaySel" style="width:auto;max-width:100%"><option value="">选择要接力的项目</option>${S.projects.map(x => `<option value="${esc(x.id)}" ${p && p.id === x.id ? 'selected' : ''}>${esc(x.name)}${x.handoff ? '（交接中）' : ''}</option>`).join('')}</select></div>`;
+  const secrets = `<div class="callout secret"><h4>敏感凭据保护</h4><ul>
+    <li>这些不同步、不提交、不进中转目录：<code>~/.claude.json</code>、<code>~/.codex/auth.json</code>、<code>~/.gemini/oauth_creds.json</code>、<code>.env</code>、SSH 私钥、MCP 令牌。</li>
+    <li><code>git add -A</code> 之前先跑一次凭据检查。<code>config.toml</code>、<code>mcp_config.json</code>、<code>.mcp.json</code>、<code>settings.json</code> 同步前看一眼有没有写死的令牌。</li>
+    <li>这张台账只记名称和位置，不要粘贴密钥、令牌或密码。</li>
+    <li>每台设备各自登录。要共用的密钥走密码管理器。误提交了密钥，先轮换，再处理历史。</li></ul></div>`;
+  if (!p) {
+    const moving = S.projects.filter(x => x.handoff);
+    return `<div class="panel">${pick}<p class="muted">${moving.length ? '进行中的接力：' + moving.map(x => esc(x.name)).join('、') + '。选一个继续。' : '选一个项目，生成离开前的清单、可复制的命令和到另一台设备后的恢复步骤。'}</p></div>${secrets}`;
+  }
+  const pid = esc(p.id);
+  if (!p.handoff) {
+    const from = dev(p.device), to = other(p.device), cur = (S.draft[p.id] || defaultTransport(p));
+    const avail = p.branch ? ['remote', 'bundle', 'patch'] : ['folder'];
+    const sel = avail.includes(cur) ? cur : avail[0];
+    const hist = p.history.slice(-5).reverse();
+    return `<div class="panel">${pick}
+      <div class="route">${esc(from.name)}<span class="arrow">→</span>${esc(to.name)}</div>
+      <p class="muted">${p.branch ? '分支 <code>' + esc(p.branch) + '</code>，' + (p.dirty > 0 ? '登记了 ' + p.dirty + ' 个未提交文件' : '没有登记未提交改动') + '，' + (p.remote ? '远程 <code>' + esc(p.remote) + '</code>' : '没有远程') + '。' : '这个目录不是 Git 仓库。'}数字不对就先到项目里改。</p>
+      <div><div class="lbl" style="margin-bottom:6px">怎么把代码和改动带过去</div><div class="opts">${avail.map(t => `<label class="opt"><input type="radio" name="tr-${pid}" id="tr-${pid}-${t}" value="${t}" data-chg="draftTr" data-id="${pid}" ${sel === t ? 'checked' : ''}${t === 'remote' && !p.remote ? ' disabled' : ''}><span><b>${TRANSPORT[t][0]}</b><small>${TRANSPORT[t][1]}${t === 'remote' && !p.remote ? ' 这个项目没有远程。' : ''}</small></span></label>`).join('')}</div></div>
+      <div class="row"><button type="button" class="btn primary" data-act="startHandoff" data-id="${pid}" id="sh-${pid}">生成这次接力的清单和命令</button></div>
+      ${hist.length ? `<div><div class="lbl" style="margin-bottom:4px">最近的接力</div><ul class="list-plain">${hist.map(h => `<li class="muted"><code>${esc(h.tag)}</code> ${esc(dev(h.from).name)} → ${esc(dev(h.to).name)}，${esc((TRANSPORT[h.transport] || [h.transport])[0])}，${esc(fmtWhen(h.doneAt))} 完成</li>`).join('')}</ul></div>` : ''}
+    </div>${secrets}`;
+  }
+  const h = p.handoff, plan = planFor(p);
+  const chk = (ph, arr) => arr.map(([k, t, sub]) => `<label class="chk"><input type="checkbox" id="ck-${pid}-${ph}-${k}" data-chg="chk" data-id="${pid}" data-ph="${ph}" data-k="${k}" ${h[ph] && h[ph][k] ? 'checked' : ''}><span><b>${esc(t)}</b>${sub ? `<small>${esc(sub)}</small>` : ''}</span></label>`).join('');
+  const done = (ph, arr) => arr.filter(([k]) => h[ph] && h[ph][k]).length + ' / ' + arr.length;
+  const miss = plan.miss.length ? `<div class="notice">命令里还有空位：${esc(plan.miss.join('、'))}。到「设置」填中转目录，到项目里填路径，命令就能直接复制。</div>` : '';
+  const honest = `<div class="callout honest"><h4>这次接力恢复的是什么</h4><p>代码、未提交改动和摘要会到 ${esc(plan.T.name)}。原 Session 留在 ${esc(plan.F.name)}，在 ${esc(plan.T.name)} 开的是读摘要的新 Session。只有云端 Session 能在两台设备上打开同一个。</p></div>`;
+  return `<div class="panel">${pick}
+      <div class="row"><div class="route">${esc(plan.F.name)}<span class="arrow">→</span>${esc(plan.T.name)}</div><span class="chip">${esc(TRANSPORT[plan.tr][0])}</span><span class="chip transit">${h.state === 'transit' ? '已离开 ' + esc(plan.F.name) : '准备中'}</span><code class="muted">${esc(h.tag)}</code><span class="grow"></span><button type="button" class="btn small ghost danger" data-act="cancelHandoff" data-id="${pid}" id="ch-${pid}">取消这次接力</button></div>
+      ${miss}${honest}
+      ${plan.tr === 'patch' ? `<label class="field" style="max-width:420px"><span>基底提交（离开前 git rev-parse HEAD 的输出）</span><input class="inp mono" id="bc-${pid}" data-chg="baseCommit" data-id="${pid}" value="${esc(h.baseCommit || '')}" placeholder="例如 fadfd11"></label>` : ''}
+    </div>
+    <div class="panel"><h3>离开 ${esc(plan.F.name)} 之前<small>${done('pre', plan.preChecks)}</small></h3>
+      <div class="steps"><div>${chk('pre', plan.preChecks)}</div><div class="cmds">${plan.pre.map(cmdBlock).join('')}</div></div>
+      <div class="row"><button type="button" class="btn ${h.state === 'transit' ? '' : 'primary'}" data-act="markTransit" data-id="${pid}" id="mt-${pid}" ${h.state === 'transit' ? 'disabled' : ''}>${h.state === 'transit' ? '已标记离开' : '我已离开 ' + esc(plan.F.name)}</button></div>
+    </div>
+    <div class="panel"><h3>到 ${esc(plan.T.name)} 之后<small>${done('post', plan.postChecks)}</small></h3>
+      <div class="steps"><div>${chk('post', plan.postChecks)}</div><div class="cmds">${plan.post.map(cmdBlock).join('')}</div></div>
+      <div class="row"><button type="button" class="btn primary" data-act="finishHandoff" data-id="${pid}" id="fh-${pid}">接力完成，项目现在在 ${esc(plan.T.name)}</button></div>
+    </div>${secrets}`;
+}
+
+function viewRegistry() {
+  const [A, B] = S.config.devices, here = S.here ? dev(S.here) : A, there = other(here.id);
+  const legend = `<div class="legend">${TIER_ORDER.map(t => `<div>${tierPill(t)}<p>${TIER[t].desc}</p></div>`).join('')}</div>`;
+  const matrix = `<div class="panel"><h3>Session 能不能跨设备</h3><div class="scroll-x"><table class="t"><thead><tr><th>类型</th><th>在原设备</th><th>在另一台设备</th><th>怎么做</th></tr></thead><tbody>${SESSION_MATRIX.map(r => `<tr><td><b>${r[0]}</b></td><td><div class="cell-stack">${tierPill(r[1])}<span class="muted">${r[2]}</span></div></td><td><div class="cell-stack">${tierPill(r[3])}<span class="muted">${r[4]}</span></div></td><td class="muted">${esc(r[5])}</td></tr>`).join('')}</tbody></table></div>
+    <p class="foot">Codex 与 Antigravity 的命令以你安装的版本为准。只用桌面端或 IDE 时，从左侧会话/线程列表恢复。</p></div>`;
+  const greg = S.config.reg;
+  const row = k => `<tr><td><div class="cell-stack"><b>${esc(k.label)}</b><code class="muted">${esc(k.path)}</code></div></td><td>${tierPill(k.tier)}</td><td><div class="togs">${[A, B].map(d => `<button type="button" class="tog" id="gt-${k.id}-${esc(d.id)}" aria-pressed="${!!(greg[k.id] && greg[k.id].on && greg[k.id].on[d.id])}" data-act="gregTog" data-k="${k.id}" data-d="${esc(d.id)}">${esc(d.name)}</button>`).join('')}</div></td><td class="muted">${esc(k.how)}</td><td><input class="inp" style="min-width:150px" id="gn-${k.id}" data-chg="gregNote" data-k="${k.id}" value="${esc((greg[k.id] && greg[k.id].note) || '')}" placeholder="备注" aria-label="${esc(k.label)} 的备注"></td></tr>`;
+  const group = (title, tool) => `<tr><td colspan="5" class="lbl" style="background:var(--sunken)">${title}</td></tr>` + KINDS.filter(k => k.scope === 'global' && k.tool === tool).map(row).join('');
+  const globals = `<div class="panel"><h3>每台设备上的全局状态<small>不属于某个项目，每台设备登记一次</small></h3><div class="scroll-x"><table class="t"><thead><tr><th>内容</th><th>分级</th><th>存在于</th><th>怎么带过去</th><th>备注</th></tr></thead><tbody>${group('Claude Code', 'claude')}${group('Codex', 'codex')}${group('Antigravity', 'anti')}${group('VS Code', 'shared')}</tbody></table></div></div>`;
+  let DF = here.drop || `<${here.name} 的中转目录>`, DT = there.drop || `<${there.name} 的中转目录>`;
+  const out = [], back = [];
+  Object.entries(GLOBAL_COPY).forEach(([id, g]) => {
+    if (!(greg[id] && greg[id].on && greg[id].on[here.id])) return;
+    if (g.dir) { out.push(cpDir(here, homeP(here, g.rel), joinP(here, DF, g.drop), { xd: g.xd })); back.push(cpDir(there, joinP(there, DT, g.drop), homeP(there, g.rel), { xd: g.xd })); }
+    else if (g.review) {
+      const f = g.drop + '.' + osSlug(here) + g.ext;
+      out.push(cpFile(here, homeP(here, g.rel), joinP(here, DF, f)));
+      back.push({ n: '只对照，不覆盖。看完差异后手动合并' }, isWin(there) ? `Compare-Object (Get-Content "${joinP(there, DT, f)}") (Get-Content "${homeP(there, g.rel)}")` : `diff "${joinP(there, DT, f)}" "${homeP(there, g.rel)}"`);
+    } else { out.push(cpFile(here, homeP(here, g.rel), joinP(here, DF, g.drop))); back.push(cpFile(there, joinP(there, DT, g.drop), homeP(there, g.rel))); }
+  });
+  const gcmd = `<div class="panel"><h3>全局状态的同步命令<small>${esc(here.name)} → ${esc(there.name)}</small></h3>${out.length ? `<div class="steps"><div class="cmds">${cmdBlock({ title: '复制到中转目录', kind: 'local', where: '在 ' + here.name + ' 的 ' + shellOf(here) + ' 里', lines: out })}</div><div class="cmds">${cmdBlock({ title: '从中转目录放回', kind: 'local', where: '在 ' + there.name + ' 的 ' + shellOf(there) + ' 里', lines: back })}</div></div><p class="foot">凭据文件不在这些命令里，也不该在中转目录里。</p>` : `<p class="muted">上表里把 ${esc(here.name)} 上存在的「需要额外同步」项点亮，这里就会生成对应的复制命令。</p>`}</div>`;
+  const pref = `<div class="panel"><h3>项目内的状态<small>在每个项目里登记它存在于哪台设备</small></h3><div class="scroll-x"><table class="t"><thead><tr><th>内容</th><th>分级</th><th>说明</th></tr></thead><tbody>${KINDS.filter(k => k.scope === 'project').map(k => `<tr><td><div class="cell-stack"><b>${esc(k.label)}</b><code class="muted">${esc(k.path)}</code></div></td><td>${tierPill(k.tier)}</td><td class="muted">${esc(k.how)}</td></tr>`).join('')}</tbody></table></div></div>`;
+  return legend + matrix + globals + gcmd + pref;
+}
+
+function viewConflicts() {
+  const all = []; S.projects.forEach(p => p.conflicts.forEach(c => all.push([p, c])));
+  all.sort((a, b) => String(b[1].date).localeCompare(String(a[1].date)));
+  const list = all.length ? `<ul class="list-plain">${all.map(([p, c]) => `<li><div class="lbl" style="margin-bottom:3px">${esc(p.name)}</div><ul class="list-plain">${conflictItem(p, c)}</ul></li>`).join('')}</ul>` : '<p class="muted">还没有冲突记录。两台设备改到同一处、套用改动失败、指令版本对不上时，在对应项目里点「记录冲突」。</p>';
+  const blocks = [
+    cmdBlock({ title: '冲突时先看清楚', kind: 'read', where: '', lines: ['git status', { n: '只列出有冲突的文件' }, 'git diff --name-only --diff-filter=U'] }),
+    cmdBlock({ title: '这台设备自己有改动时，先收起来', kind: 'local', where: '', lines: ['git stash push -u -m "local-before-handoff"', { n: '套用完带过来的内容后再取回，冲突在这一步解决' }, 'git stash pop'] }),
+    cmdBlock({ title: '逐个文件决定留哪边', kind: 'local', where: '', lines: [{ n: 'ours 是这台设备原有的版本，theirs 是带过来的版本。把 <文件> 换成实际路径' }, 'git restore --ours -- <文件>', 'git restore --theirs -- <文件>'] }),
+    cmdBlock({ title: '放弃这次套用', kind: 'local', where: '', lines: [{ n: '回到套用之前。前提是套用前工作区是干净的' }, 'git reset --merge'] })
+  ];
+  return `<div class="panel"><h3>冲突处理记录<small>${all.length} 条</small></h3><div class="row"><select class="inp" id="confProj" style="width:auto;max-width:100%" aria-label="选择项目">${S.projects.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('')}</select><button type="button" class="btn primary" data-act="addConflictPick" id="btn-addconf" ${S.projects.length ? '' : 'disabled'}>记录冲突</button></div>${list}</div>
+    <div class="panel"><h3>处理冲突的命令</h3><p class="muted">两边都改了同一处时不强推、不覆盖。先收起一边，逐个文件决定，处理完回来记一笔。</p><div class="steps"><div class="cmds">${blocks[0]}${blocks[1]}</div><div class="cmds">${blocks[2]}${blocks[3]}</div></div></div>`;
+}
+
+function viewSettings() {
+  const devs = S.config.devices.map((d, i) => `<div class="panel"><h3>${i === 0 ? '第一台设备' : '第二台设备'}</h3>
+    <label class="field"><span>名称</span><input class="inp" id="cfg-name-${i}" data-chg="cfg" data-i="${i}" data-k="name" value="${esc(d.name)}"></label>
+    <label class="field"><span>系统</span><select class="inp" id="cfg-os-${i}" data-chg="cfg" data-i="${i}" data-k="os"><option value="windows" ${d.os === 'windows' ? 'selected' : ''}>Windows（命令用 PowerShell）</option><option value="mac" ${d.os === 'mac' ? 'selected' : ''}>macOS（命令用 zsh）</option><option value="linux" ${d.os === 'linux' ? 'selected' : ''}>Linux（命令用 bash）</option></select></label>
+    <label class="field"><span>中转目录</span><input class="inp mono" id="cfg-drop-${i}" data-chg="cfg" data-i="${i}" data-k="drop" value="${esc(d.drop)}" placeholder="${d.os === 'windows' ? 'D:\\handoff' : '~/handoff 请写成完整路径'}"><small>两台设备都能读写的地方：网盘文件夹、共享盘或 U 盘。bundle、补丁和额外同步的文件放这里。凭据不放这里。</small></label></div>`).join('');
+  const store = S.mode === 'file'
+    ? '数据就是这台电脑上的 ledger.json 文件，Claude Code、Codex、Antigravity 和这个页面共用它。页面每几秒会重新读一次，另一边改了这里也会跟着更新。要换设备，把 ledger.json 放进同步的文件夹或用下面的备份搬运。'
+    : S.mode === 'db'
+    ? '数据保存在这个页面自己的云端数据库里。两台设备登录同一个 claude.ai 账户打开这个页面，看到的是同一份。'
+    : '现在是本地模式，数据只在这个浏览器里。用下面的备份在两台设备之间搬运。';
+  return `<div class="setgrid">${devs}</div>
+    <div class="panel"><h3>每天怎么用</h3><ul class="list-plain">
+      <li><b>离开前</b>　对 Claude Code、Codex 或 Antigravity 说「接力」。它会写 HANDOFF.md、更新台账、打印清单和命令；写入远程的命令留给你自己执行。</li>
+      <li><b>到另一台</b>　打开这个页面，同一个项目显示「交接中」。对代理说「接棒」，照「到达之后」做。</li>
+      <li><b>回到原设备</b>　先反向接力一次，再用登记的 Session ID 原样恢复：<code>claude --resume &lt;id&gt;</code>、<code>codex resume &lt;id&gt;</code> 或 <code>agy --conversation &lt;id&gt;</code>。</li></ul></div>
+    <div class="panel"><h3>数据存在哪里</h3><p class="muted">${store}</p>
+      <div class="row"><button type="button" class="btn" data-act="exportJson" id="btn-export">生成备份</button><button type="button" class="btn" data-act="copyExport" id="btn-copyexp">复制备份</button></div>
+      <textarea class="inp mono" id="io" rows="6" placeholder="备份内容会出现在这里。要导入时把另一份备份粘贴进来。" aria-label="备份内容">${esc(S.io || '')}</textarea>
+      <div class="row"><button type="button" class="btn danger" data-act="importJson" id="btn-import">用上面的内容覆盖现有数据</button></div></div>`;
+}
+
+function renderView() {
+  S.cmdSeq = 0; Object.keys(CMDS).forEach(k => delete CMDS[k]);
+  const v = S.view;
+  $('#view').innerHTML = `<div style="display:flex;flex-direction:column;gap:16px">${v === 'projects' ? viewProjects() : v === 'relay' ? viewRelay() : v === 'registry' ? viewRegistry() : v === 'conflicts' ? viewConflicts() : viewSettings()}</div>`;
+}
+function renderAll() {
+  const view = $('#view'), ae = document.activeElement;
+  if (ae && view.contains(ae) && /^(INPUT|TEXTAREA)$/.test(ae.tagName) && !/checkbox|radio/.test(ae.type)) { S.pending = true; renderChrome(); renderTrack(); return; }
+  S.pending = false;
+  const fid = ae && ae.id && !$('#dlg').open ? ae.id : null;
+  renderChrome(); renderTrack(); renderView();
+  if (fid && document.activeElement !== ae) { const el = document.getElementById(fid); if (el) el.focus({ preventScroll: true }); }
+}
+let toastT = 0;
+function toast(msg) { const t = $('#toast'); t.textContent = msg; t.hidden = false; clearTimeout(toastT); toastT = setTimeout(() => { t.hidden = true; }, 3200); }
+
+/* ---------- 表单对话框 ---------- */
+function openForm(o) {
+  const dlg = $('#dlg'), vals = o.values || {};
+  const field = f => {
+    const v = getPath(vals, f.key), id = 'fld-' + f.key.replace(/\./g, '-');
+    let ctl;
+    if (f.type === 'select') ctl = `<select class="inp" id="${id}" name="${f.key}">${f.options.map(([val, lab]) => `<option value="${esc(val)}" ${String(v == null ? '' : v) === String(val) ? 'selected' : ''}>${esc(lab)}</option>`).join('')}</select>`;
+    else if (f.type === 'textarea') ctl = `<textarea class="inp" id="${id}" name="${f.key}" rows="3">${esc(v)}</textarea>`;
+    else ctl = `<input class="inp ${f.mono ? 'mono' : ''}" id="${id}" name="${f.key}" type="${f.type || 'text'}" ${f.type === 'number' ? 'min="0" step="1" inputmode="numeric"' : ''} value="${esc(v == null ? '' : v)}" ${f.required ? 'required' : ''} autocomplete="off">`;
+    return `<label class="field ${f.span === 2 ? 'span2' : ''}"><span>${esc(f.label)}</span>${ctl}${f.hint ? `<small>${esc(f.hint)}</small>` : ''}</label>`;
+  };
+  dlg.innerHTML = `<form class="form" id="dlgForm" novalidate><header><h3>${esc(o.title)}</h3><button type="button" class="btn small ghost" data-x id="dlg-x">关闭</button></header>
+    <div class="form-body">${o.intro ? `<p class="muted">${esc(o.intro)}</p>` : ''}<div class="form-grid">${o.fields.map(field).join('')}</div></div>
+    <footer>${o.onDelete ? '<button type="button" class="btn danger ghost" data-del id="dlg-del">删除</button>' : ''}<span class="grow"></span><button type="button" class="btn ghost" data-x id="dlg-cancel">取消</button><button type="submit" class="btn primary" id="dlg-save">保存</button></footer></form>`;
+  const form = $('#dlgForm', dlg);
+  form.addEventListener('submit', e => {
+    e.preventDefault();
+    const out = clone(vals);
+    for (const f of o.fields) {
+      const el = form.elements[f.key]; let v = el.value;
+      if (f.type === 'number') v = v === '' ? (f.nullable ? null : 0) : Math.max(0, parseInt(v, 10) || 0);
+      else v = v.trim();
+      if (f.required && !v) { el.focus(); toast('请填写「' + f.label + '」。'); return; }
+      setPath(out, f.key, v);
+    }
+    dlg.close(); o.onSave(out);
+  });
+  dlg.onclick = e => {
+    if (e.target.closest('[data-x]')) { dlg.close(); return; }
+    const del = e.target.closest('[data-del]');
+    if (del) { if (del.dataset.armed) { dlg.close(); o.onDelete(); } else { del.dataset.armed = '1'; del.textContent = '再点一次，确认删除'; } }
+  };
+  if (typeof dlg.showModal === 'function') dlg.showModal(); else dlg.setAttribute('open', '');
+}
+function projectFields() {
+  const [A, B] = S.config.devices;
+  return [
+    { key: 'name', label: '项目名', required: true },
+    { key: 'tool', label: '正在使用的工具', type: 'select', options: Object.entries(TOOL) },
+    { key: 'device', label: '当前所在设备', type: 'select', options: S.config.devices.map(d => [d.id, d.name]), hint: '最新的工作现场在哪台设备上。' },
+    { key: 'status', label: '状态', type: 'select', options: Object.entries(STATUS) },
+    { key: 'paths.' + A.id, label: A.name + ' 上的路径', mono: true, span: 2 },
+    { key: 'paths.' + B.id, label: B.name + ' 上的路径', mono: true, span: 2 },
+    { key: 'branch', label: '分支', mono: true, hint: '留空表示这个目录不是 Git 仓库。' },
+    { key: 'worktree', label: 'Worktree', mono: true, hint: '正在用的 worktree 目录。没有就留空。' },
+    { key: 'remote', label: '远程', mono: true, hint: '例如 origin。留空表示没有远程。' },
+    { key: 'transport', label: '默认带走方式', type: 'select', options: [['', '按情况自动选']].concat(Object.entries(TRANSPORT).map(([k, v]) => [k, v[0]])) },
+    { key: 'dirty', label: '未提交改动（文件数）', type: 'number', hint: 'git status --short 的行数。' },
+    { key: 'unpushed', label: '未推送的提交数', type: 'number', nullable: true, hint: '不确定就留空。' },
+    { key: 'lastTask', label: '最近一次任务', type: 'textarea', span: 2 },
+    { key: 'nextAction', label: '下一步动作', type: 'textarea', span: 2 },
+    { key: 'verify.state', label: '验证结果', type: 'select', options: Object.entries(VERIFY) },
+    { key: 'verify.cmd', label: '验证命令', mono: true, hint: '接力后在另一台设备重跑。' },
+    { key: 'verify.note', label: '验证说明', type: 'textarea', span: 2 },
+    { key: 'note', label: '交接备注', type: 'textarea', span: 2, hint: '只写摘要。不要粘贴密钥、令牌或密码。' }
+  ];
+}
+function sessionFields() {
+  return [
+    { key: 'title', label: '名称', span: 2, hint: '工具里显示的 Session、线程或会话名。' },
+    { key: 'tool', label: '工具', type: 'select', options: [['claude', 'Claude Code'], ['codex', 'Codex'], ['anti', 'Antigravity']] },
+    { key: 'device', label: '所在设备', type: 'select', options: S.config.devices.map(d => [d.id, d.name]) },
+    { key: 'kind', label: '类型', type: 'select', options: [['local', '本地 Session'], ['cloud', '云端 Session'], ['remote', 'Remote Control']] },
+    { key: 'lastUsed', label: '最近使用', type: 'date' },
+    { key: 'sessionId', label: 'Session ID', mono: true, span: 2 },
+    { key: 'cwd', label: '启动目录', mono: true, span: 2, hint: '这个 Session 是在哪个目录启动的。留空就用项目路径。Claude Code 按启动目录存放 Session。' },
+    { key: 'carry', label: '换到另一台设备时', type: 'select', span: 2, options: [['summary', '读摘要开新 Session（默认，原 Session 留在原设备）'], ['transcript', '搬运转录或 brain 目录（非官方，适用于 Claude Code / Antigravity 本地会话）']] },
+    { key: 'note', label: '备注', type: 'textarea', span: 2 }
+  ];
+}
+function conflictFields() {
+  const [A, B] = S.config.devices;
+  return [
+    { key: 'kind', label: '类型', type: 'select', options: Object.entries(CONFLICT_KIND) },
+    { key: 'date', label: '日期', type: 'date' },
+    { key: 'device', label: '在哪台设备上处理', type: 'select', options: S.config.devices.map(d => [d.id, d.name]) },
+    { key: 'kept', label: '结果', type: 'select', options: [['尚未解决', '尚未解决'], ['保留 ' + A.name + ' 的版本', '保留 ' + A.name + ' 的版本'], ['保留 ' + B.name + ' 的版本', '保留 ' + B.name + ' 的版本'], ['手动合并', '手动合并']] },
+    { key: 'files', label: '涉及的文件', mono: true, span: 2 },
+    { key: 'resolution', label: '怎么处理的', type: 'textarea', span: 2 }
+  ];
+}
+function mutate(pid, fn) {
+  const p = S.projects.find(x => x.id === pid); if (!p) return;
+  const c = clone(p); fn(c); c.updatedAt = new Date().toISOString(); c.updatedOn = S.here || '';
+  Store.saveProject(normProject(c));
+}
+function editSession(pid, sid) {
+  const p = S.projects.find(x => x.id === pid); if (!p) return;
+  const cur = sid ? p.sessions.find(s => s.id === sid) : null;
+  const defTool = ['claude', 'codex', 'anti'].includes(p.tool) ? p.tool : (p.tool === 'codex+anti' ? 'codex' : 'claude');
+  openForm({
+    title: cur ? '编辑 Session' : '登记 Session', fields: sessionFields(),
+    intro: '登记的是「回到那台设备时怎么原样打开」。它不会让这个 Session 出现在另一台设备上。',
+    values: cur || { id: rid('s_'), tool: defTool, device: S.here || p.device, kind: 'local', carry: 'summary', lastUsed: localDate(), title: '', sessionId: '', cwd: '', note: '' },
+    onSave: v => mutate(pid, c => { const i = c.sessions.findIndex(s => s.id === v.id); if (i >= 0) c.sessions[i] = v; else c.sessions.push(v); }),
+    onDelete: cur ? () => mutate(pid, c => { c.sessions = c.sessions.filter(s => s.id !== sid); }) : null
+  });
+}
+function editConflict(pid, cid) {
+  const p = S.projects.find(x => x.id === pid); if (!p) return;
+  const cur = cid ? p.conflicts.find(c => c.id === cid) : null;
+  openForm({
+    title: (cur ? '编辑冲突记录' : '记录冲突') + ' · ' + p.name, fields: conflictFields(),
+    values: cur || { id: rid('c_'), kind: 'both', date: localDate(), device: S.here || p.device, kept: '尚未解决', files: '', resolution: '' },
+    onSave: v => mutate(pid, c => { const i = c.conflicts.findIndex(x => x.id === v.id); if (i >= 0) c.conflicts[i] = v; else c.conflicts.push(v); }),
+    onDelete: cur ? () => mutate(pid, c => { c.conflicts = c.conflicts.filter(x => x.id !== cid); }) : null
+  });
+}
+function copyText(text, btn) {
+  const ok = () => { if (btn) { const old = btn.textContent; btn.textContent = '已复制'; setTimeout(() => { if (btn.isConnected) btn.textContent = old; }, 1400); } };
+  const fallback = () => {
+    const pre = btn && document.getElementById(btn.dataset.c);
+    if (pre && pre.tagName === 'TEXTAREA') pre.select();
+    else if (pre) { const r = document.createRange(); r.selectNodeContents(pre); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }
+    toast(pre ? '没能自动复制。内容已选中，按 Ctrl+C 或 ⌘C。' : '这里不允许自动复制，请手动选中命令复制。');
+  };
+  try { navigator.clipboard.writeText(text).then(ok, fallback); } catch (e) { fallback(); }
+}
+
+/* ---------- 交互 ---------- */
+const ACT = {
+  tab: el => { S.view = el.dataset.v; renderAll(); },
+  toggle: el => { S.open = S.open === el.dataset.id ? null : el.dataset.id; renderAll(); },
+  open: el => { S.view = 'projects'; S.open = el.dataset.id; S.filters = { q: '', device: '', tool: '', status: '', dirty: '' }; ['f-q', 'f-tool', 'f-status', 'f-dirty'].forEach(i => { $('#' + i).value = ''; }); renderAll(); const r = document.getElementById('row-' + el.dataset.id); if (r) r.scrollIntoView({ block: 'nearest' }); },
+  clearFilters: () => { S.filters = { q: '', device: '', tool: '', status: '', dirty: '' }; ['f-q', 'f-tool', 'f-status', 'f-dirty'].forEach(i => { $('#' + i).value = ''; }); renderAll(); },
+  newProject: () => openForm({
+    title: '登记项目', fields: projectFields(),
+    values: { device: S.here || S.config.devices[0].id, tool: 'claude', status: 'active', paths: {}, verify: { state: 'none' }, dirty: 0, unpushed: null, branch: 'main', remote: 'origin' },
+    onSave: v => { v.id = rid('p_'); v.updatedAt = new Date().toISOString(); v.updatedOn = S.here || ''; S.open = v.id; Store.saveProject(normProject(v)); }
+  }),
+  editProject: el => { const p = S.projects.find(x => x.id === el.dataset.id); if (!p) return; openForm({ title: '编辑项目', fields: projectFields(), values: p, onSave: v => mutate(p.id, c => Object.assign(c, v)), onDelete: () => { if (S.open === p.id) S.open = null; Store.deleteProject(p.id); } }); },
+  addSession: el => editSession(el.dataset.id, null),
+  editSession: el => editSession(el.dataset.id, el.dataset.s),
+  addConflict: el => editConflict(el.dataset.id, null),
+  addConflictPick: () => { const s = $('#confProj'); if (s && s.value) editConflict(s.value, null); },
+  editConflict: el => editConflict(el.dataset.id, el.dataset.c),
+  regTog: el => mutate(el.dataset.id, c => { const r = c.reg[el.dataset.k] || (c.reg[el.dataset.k] = { on: {} }); r.on = r.on || {}; r.on[el.dataset.d] = !r.on[el.dataset.d]; }),
+  gregTog: el => { const g = S.config.reg; const r = g[el.dataset.k] || (g[el.dataset.k] = { on: {} }); r.on = r.on || {}; r.on[el.dataset.d] = !r.on[el.dataset.d]; Store.saveConfig(); },
+  relay: el => { S.view = 'relay'; S.relayPid = el.dataset.id; renderAll(); window.scrollTo({ top: $('#tabs').offsetTop - 8 }); },
+  startHandoff: el => mutate(el.dataset.id, c => {
+    const from = dev(c.device), to = other(c.device), avail = c.branch ? ['remote', 'bundle', 'patch'] : ['folder'];
+    let tr = S.draft[c.id] || defaultTransport(c); if (!avail.includes(tr) || (tr === 'remote' && !c.remote)) tr = c.branch ? 'bundle' : 'folder';
+    c.handoff = { tag: localDate().replace(/-/g, '') + '-' + osSlug(from), from: from.id, to: to.id, transport: tr, state: 'prep', pre: {}, post: {}, hadDirty: c.dirty > 0, branch: c.branch, baseCommit: '', createdAt: new Date().toISOString() };
+  }),
+  markTransit: el => mutate(el.dataset.id, c => { if (c.handoff) c.handoff.state = 'transit'; }),
+  finishHandoff: el => { mutate(el.dataset.id, c => { const h = c.handoff; if (!h) return; c.history = c.history.concat({ tag: h.tag, from: h.from, to: h.to, transport: h.transport, doneAt: new Date().toISOString() }).slice(-10); c.device = h.to; c.handoff = null; }); toast('已记下：项目现在在另一台设备。'); },
+  cancelHandoff: el => { if (!el.dataset.armed) { el.dataset.armed = '1'; el.textContent = '再点一次，确认取消'; return; } mutate(el.dataset.id, c => { c.handoff = null; }); },
+  copy: el => copyText(CMDS[el.dataset.c] || '', el),
+  exportJson: () => { S.io = JSON.stringify({ app: 'relaydesk', version: 1, exportedAt: new Date().toISOString(), config: S.config, projects: S.projects }, null, 2); $('#io').value = S.io; toast('备份已生成。'); },
+  copyExport: el => { const t = $('#io').value; if (!t) { toast('先点「生成备份」。'); return; } el.dataset.c = 'io'; copyText(t, el); },
+  importJson: el => {
+    let d; try { d = JSON.parse($('#io').value); } catch (e) { toast('这不是有效的备份内容。'); return; }
+    if (!d || !Array.isArray(d.projects)) { toast('备份里没有项目列表。'); return; }
+    if (!el.dataset.armed) { el.dataset.armed = '1'; el.textContent = '再点一次，确认覆盖 ' + S.projects.length + ' 个项目'; return; }
+    Store.replaceAll(d); toast('已导入 ' + d.projects.length + ' 个项目。');
+  }
+};
+const CHG = {
+  here: el => { S.here = el.value === 'none' ? null : el.value; try { localStorage.setItem('relaydesk.here', el.value); } catch (e) {} renderAll(); },
+  filter: el => { S.filters[el.dataset.f] = el.value; renderAll(); },
+  relaySel: el => { S.relayPid = el.value || null; renderAll(); },
+  draftTr: el => { S.draft[el.dataset.id] = el.value; },
+  chk: el => mutate(el.dataset.id, c => { if (!c.handoff) return; const ph = el.dataset.ph; c.handoff[ph] = c.handoff[ph] || {}; c.handoff[ph][el.dataset.k] = el.checked; }),
+  baseCommit: el => mutate(el.dataset.id, c => { if (c.handoff) c.handoff.baseCommit = el.value.trim(); }),
+  gregNote: el => { const g = S.config.reg; const r = g[el.dataset.k] || (g[el.dataset.k] = { on: {} }); r.note = el.value.trim(); Store.saveConfig(); },
+  cfg: el => { const d = S.config.devices[+el.dataset.i]; if (!d) return; const v = el.value.trim(); if (el.dataset.k === 'name' && !v) { el.value = d.name; return; } d[el.dataset.k] = v; Store.saveConfig(); }
+};
+document.addEventListener('click', e => { const el = e.target.closest('[data-act]'); if (el && ACT[el.dataset.act] && !el.disabled) ACT[el.dataset.act](el, e); });
+document.addEventListener('change', e => { const el = e.target.closest('[data-chg]'); if (el && CHG[el.dataset.chg]) CHG[el.dataset.chg](el, e); });
+document.addEventListener('input', e => { if (e.target.id === 'f-q') { S.filters.q = e.target.value; renderView(); } else if (e.target.id === 'io') S.io = e.target.value; });
+document.addEventListener('focusout', () => setTimeout(() => { if (S.pending) renderAll(); }, 0));
+
+pickHere(); renderAll(); Store.init();
+})();
+</script>
