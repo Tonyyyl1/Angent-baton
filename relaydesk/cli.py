@@ -913,6 +913,7 @@ def cmd_device(args):
                 d["name"] = args.name
             if args.os is not None:
                 d["os"] = args.os
+                d["osExplicit"] = True
             if args.drop is not None:
                 if which != L.here(led, local):
                     val, notice = fix_foreign_path(led["config"], which, args.drop, "--drop")
@@ -1030,6 +1031,7 @@ def cmd_import(args):
 class _FileStore(object):
     def __init__(self, path):
         self.path = path
+        self.ledger_path = path
 
     def read(self):
         return L.load(self.path), L.rev(self.path)
@@ -1037,6 +1039,250 @@ class _FileStore(object):
     def update(self, fn):
         led = L.update(self.path, fn)
         return led, L.rev(self.path)
+
+
+# ---------------------------------------------------------------- cloud relay commands
+
+def _call_engine(fn, *a, **kw):
+    try:
+        return fn(*a, **kw)
+    except (CliError, LookupError, L.LedgerError, OSError):
+        raise
+    except Exception as e:
+        mod_name = getattr(e.__class__, "__module__", "") or ""
+        if mod_name.startswith("relaydesk."):
+            msg = str(e)
+            if hasattr(e, "gaps") and "缺口" not in msg:
+                msg = "检测到会话缺口：\n" + msg
+            raise CliError(msg, 1)
+        raise
+
+
+def cmd_cloud_remotes(args):
+    storage = _mod("storage")
+    has_rc = bool(_call_engine(storage.has_rclone))
+    if not has_rc:
+        if args.json:
+            out(json.dumps({"hasRclone": False, "remotes": []}, ensure_ascii=False, indent=1))
+        else:
+            out("未检测到 rclone。请先安装 rclone（如 brew install rclone）并运行 rclone config 配置网盘。")
+        return 0
+    remotes = list(_call_engine(storage.discover_rclone_remotes, config_path=args.rclone_config))
+    if args.json:
+        out(json.dumps({"hasRclone": True, "remotes": remotes}, ensure_ascii=False, indent=1))
+        return 0
+    if not remotes:
+        out("没有发现已配置的 rclone 连接。请先运行 rclone config。")
+        return 0
+    for r in remotes:
+        out(r)
+    out("共发现 %d 个 rclone 连接。" % len(remotes))
+    return 0
+
+
+def cmd_pair(args):
+    path, local = ctx()
+    eng = _mod("relay_engine")
+    only_status = (
+        args.status
+        and args.remote is None
+        and args.root is None
+        and args.provider is None
+        and args.rclone_config is None
+        and not args.accept
+    )
+    if only_status:
+        st = _call_engine(eng.cloud_status, ledger_path=path, local=local)
+    else:
+        st = _call_engine(
+            eng.pair_device,
+            remote=args.remote,
+            root=args.root,
+            provider_type=args.provider,
+            rclone_config=args.rclone_config,
+            accept=args.accept,
+            ledger_path=path,
+            local=local,
+        )
+    if args.json:
+        out(json.dumps(st, ensure_ascii=False, indent=1))
+        return 0
+    cl = st.get("cloud") or {}
+    if st.get("configured"):
+        if cl.get("provider") == "local":
+            out("云存储：本地共享目录（%s）" % (cl.get("root") or ""))
+        else:
+            out("云存储：rclone（连接 %s，目录 %s）" % (cl.get("remote") or "", cl.get("root") or "/"))
+    else:
+        out("云存储：未配置（运行 relay pair --remote <连接> --root <目录> 配置）")
+    out("本机设备：%s（%s）" % (st.get("alias") or "未指定", st.get("deviceId") or "尚未生成密钥"))
+    if st.get("keyFingerprint"):
+        out("本机公钥指纹：%s" % st["keyFingerprint"])
+    peer = st.get("peer")
+    if isinstance(peer, dict):
+        out("对端设备：%s（%s，系统 %s）" % (peer.get("alias") or "", peer.get("deviceId") or "", peer.get("os") or ""))
+        if peer.get("keyFingerprint"):
+            out("对端公钥指纹：%s" % peer["keyFingerprint"])
+    else:
+        out("对端设备：尚未在云端发现对端公钥")
+    if st.get("pairFingerprint"):
+        out("配对指纹：%s" % st["pairFingerprint"])
+    if st.get("paired"):
+        out("配对状态：已配对（双机公钥已锁定）")
+    elif st.get("pairFingerprint"):
+        out("配对状态：待确认（请核对两台设备显示的配对指纹完全一致后，运行 relay pair --accept）")
+    else:
+        out("配对状态：等待另一台设备发布公钥")
+    return 0
+
+
+def cmd_send(args):
+    path, local = ctx()
+    eng = _mod("relay_engine")
+    res = _call_engine(
+        eng.send_project,
+        project_key=args.project,
+        to_alias=args.to,
+        cwd=os.getcwd(),
+        ledger_path=path,
+        local=local,
+    )
+    if args.json:
+        out(json.dumps(res, ensure_ascii=False, indent=1))
+        return 0
+    out("交接包已上传并校验通过：%s（%s）" % (res["projectName"], res["projectId"]))
+    out("交接编号：%s%s" % (res["relayId"], ("（父交接：%s）" % res["parentRelayId"]) if res.get("parentRelayId") else ""))
+    out("流向：%s → %s    大小：%s 字节    归档会话：%s 条" % (
+        res["from"], res["to"], res["packageSize"], res["sessionCount"]))
+    out("SHA-256：%s" % res["packageSha256"])
+    if res.get("excludedFiles"):
+        out("已自动排除本地敏感文件：%s" % "、".join(res["excludedFiles"]))
+    out(res["message"])
+    return 0
+
+
+def cmd_inbox(args):
+    path, local = ctx()
+    eng = _mod("relay_engine")
+    res = _call_engine(eng.list_inbox, ledger_path=path, local=local)
+    if args.json:
+        out(json.dumps(res, ensure_ascii=False, indent=1))
+        return 0
+    for rec in res.get("syncedReceipts") or []:
+        out("已同步签收回执：%s（项目 %s 已由 %s 签收）" % (
+            rec.get("relayId", ""), rec.get("projectId", ""), rec.get("toAlias", "")))
+    incoming = res.get("incoming") or []
+    if not incoming:
+        out("当前没有待领取的交接包。")
+        return 0
+    for item in incoming:
+        if item.get("tampered"):
+            out("[警告：签名或校验异常] %s  来源：%s  错误：%s" % (
+                item.get("relayId", ""), item.get("fromAlias", "?"), item.get("error", "数据可能被篡改")))
+            continue
+        ack_tag = " [待补传回执]" if item.get("pendingAck") else ""
+        out("%s%s  项目：%s（%s）  来自：%s → %s  分支：%s  未提交：%s  会话：%s" % (
+            item.get("relayId", ""),
+            ack_tag,
+            item.get("projectName", ""),
+            item.get("projectId", ""),
+            item.get("fromAlias", ""),
+            item.get("toAlias", ""),
+            item.get("branch") or "无分支",
+            item.get("dirty", 0),
+            item.get("sessionCount", 0),
+        ))
+        if item.get("lastTask"):
+            out("  最近任务：%s" % item["lastTask"])
+        if item.get("nextAction"):
+            out("  下一步：%s" % item["nextAction"])
+    out("共 %d 个待接棒交接包。运行 relay receive <交接编号> 领取。" % len(incoming))
+    return 0
+
+
+def cmd_receive(args):
+    path, local = ctx()
+    eng = _mod("relay_engine")
+    res = _call_engine(
+        eng.receive_relay,
+        args.relay_id,
+        target_path=args.path,
+        into_path=args.into,
+        ledger_path=path,
+        local=local,
+    )
+    if args.json:
+        out(json.dumps(res, ensure_ascii=False, indent=1))
+        return 0
+    out(res.get("message") or ("接棒完成：%s" % res.get("projectName", "")))
+    out("交接编号：%s%s" % (res["relayId"], ("（父交接：%s）" % res["parentRelayId"]) if res.get("parentRelayId") else ""))
+    out("落盘目录：%s" % res.get("targetPath", ""))
+    if res.get("lastTask"):
+        out("最近任务：%s" % res["lastTask"])
+    if res.get("nextAction"):
+        out("下一步：%s" % res["nextAction"])
+    conv = res.get("conversations") or {}
+    out("历史对话归档：共 %d 条（新增 %d，更新 %d）。可用 relay transcripts %s 查阅。" % (
+        conv.get("total", 0), conv.get("added", 0), conv.get("updated", 0), res.get("projectId", "")))
+    out("说明：原设备的本地原生 Session 仍留在原设备上；本机可读取 HANDOFF.md、台账与归档对话开启新会话继续工作。")
+    return 0
+
+
+def cmd_transcripts(args):
+    path, local = ctx()
+    eng = _mod("relay_engine")
+    res = _call_engine(
+        eng.query_transcripts,
+        project_key=args.project,
+        session_id=args.session,
+        tool=args.tool,
+        grep=args.grep,
+        cwd=os.getcwd(),
+        ledger_path=path,
+        local=local,
+    )
+    if args.json:
+        out(json.dumps(res, ensure_ascii=False, indent=1))
+        return 0
+    if args.session:
+        md = res.get("markdown")
+        if not md:
+            raise CliError("在项目 %s 的归档历史中找不到会话：%s" % (res.get("projectId", ""), args.session), 1)
+        out(md.rstrip("\n"))
+        return 0
+    if args.grep:
+        matches = res.get("matches") or []
+        if not matches:
+            out("在项目 %s 的历史对话中未找到匹配「%s」的内容。" % (res.get("projectId", ""), args.grep))
+            return 0
+        for m in matches:
+            snippet = m.get("snippet") or m.get("content") or m.get("text") or ""
+            role = (" [%s]" % m["role"]) if m.get("role") else ""
+            out("[%s] %s%s  %s：%s" % (
+                m.get("tool", ""),
+                m.get("sessionId", ""),
+                role,
+                m.get("title") or "（无标题）",
+                snippet,
+            ))
+        out("共 %d 处匹配。" % len(matches))
+        return 0
+    sessions = res.get("sessions") or []
+    if not sessions:
+        out("项目 %s 暂无已归档的历史对话。" % res.get("projectId", ""))
+        return 0
+    for s in sessions:
+        out("[%s] %s  来源：%s  回合：%s  最近使用：%s  版本：%s  %s" % (
+            s.get("tool", ""),
+            s.get("sessionId", ""),
+            s.get("originDevice", ""),
+            s.get("turnCount", 0),
+            s.get("lastUsed", ""),
+            s.get("contentVersion", ""),
+            s.get("title") or "（无标题）",
+        ))
+    out("共 %d 条归档会话。用 --session <ID> 查看全文，或 --grep <关键词> 搜索。" % len(sessions))
+    return 0
 
 
 def cmd_serve(args):
@@ -1265,6 +1511,44 @@ def build_parser():
     sp.add_argument("--anti", action="store_true")
     sp.add_argument("--dry-run", action="store_true")
     sp.add_argument("--force", action="store_true")
+
+    sp = P("cloud", "云存储辅助命令", None)
+    cls = sp.add_subparsers(dest="sub", parser_class=_Parser)
+    cls.required = True
+    rm = cls.add_parser("remotes", help="列出本机已授权的 rclone 连接")
+    rm.set_defaults(func=cmd_cloud_remotes)
+    rm.add_argument("--rclone-config")
+    rm.add_argument("--json", action="store_true")
+
+    sp = P("pair", "配置云存储并配对双机公钥", cmd_pair)
+    sp.add_argument("--remote")
+    sp.add_argument("--root")
+    sp.add_argument("--provider", choices=["rclone", "local"], default=None)
+    sp.add_argument("--rclone-config")
+    sp.add_argument("--accept", action="store_true")
+    sp.add_argument("--status", action="store_true")
+    sp.add_argument("--json", action="store_true")
+
+    sp = P("send", "加密打包并自动上传交棒", cmd_send)
+    sp.add_argument("project", nargs="?")
+    sp.add_argument("--to", choices=["a", "b"])
+    sp.add_argument("--json", action="store_true")
+
+    sp = P("inbox", "查看云端待接棒交接包并同步回执", cmd_inbox)
+    sp.add_argument("--json", action="store_true")
+
+    sp = P("receive", "领取、验签解密并恢复云端交接包", cmd_receive)
+    sp.add_argument("relay_id")
+    sp.add_argument("--path")
+    sp.add_argument("--into")
+    sp.add_argument("--json", action="store_true")
+
+    sp = P("transcripts", "查阅或检索跨机归档的历史对话全文", cmd_transcripts)
+    sp.add_argument("project", nargs="?")
+    sp.add_argument("--session")
+    sp.add_argument("--tool", choices=SESSION_TOOLS)
+    sp.add_argument("--grep")
+    sp.add_argument("--json", action="store_true")
     return ap
 
 

@@ -5,13 +5,17 @@ Unknown fields are always preserved.
 """
 import copy
 import json
+import ntpath
 import os
 import platform
+import posixpath
+import re
 import secrets
 import socket
 import string
 import tempfile
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,6 +35,26 @@ def tool_dir():
 
 
 # ---------------------------------------------------------------- normalisation
+
+_OS_ALIASES = {
+    "windows": "windows",
+    "win": "windows",
+    "win32": "windows",
+    "mac": "mac",
+    "macos": "mac",
+    "darwin": "mac",
+    "osx": "mac",
+    "linux": "linux",
+}
+
+
+def _norm_os(val, default_os):
+    if isinstance(val, str):
+        mapped = _OS_ALIASES.get(val.strip().lower())
+        if mapped:
+            return mapped
+    return default_os
+
 
 def default_config():
     return {
@@ -53,6 +77,9 @@ def norm_config(c):
             m = dict(d["devices"][i])
             if isinstance(x, dict):
                 m.update(x)
+            if not m.get("id"):
+                m["id"] = d["devices"][i]["id"]
+            m["os"] = _norm_os(m.get("os"), d["devices"][i]["os"])
             merged.append(m)
         out["devices"] = merged
     else:
@@ -251,8 +278,106 @@ def rev(path):
 
 # ---------------------------------------------------------------- lookup helpers
 
+_WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_WIN_INVALID_CHARS = frozenset('<>:"|?*')
+_WIN_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {"COM%d" % i for i in range(1, 10)}
+    | {"LPT%d" % i for i in range(1, 10)}
+)
+
+
+def _is_win_path(p):
+    return bool(_WIN_DRIVE_RE.match(p) or p.startswith("\\\\"))
+
+
+def _is_posix_abs(p):
+    return p.startswith("/") and not p.startswith("//")
+
+
+def canonical_local_path(p: str) -> str:
+    """Canonicalize a local path without mangling foreign-OS paths."""
+    if not p:
+        return ""
+    s = str(p)
+    if not s:
+        return ""
+    if os.name != "nt" and _is_win_path(s):
+        norm = ntpath.normpath(unicodedata.normalize("NFC", s)).lower()
+        if norm.startswith("\\\\") and len(norm) > 2:
+            norm = "\\\\" + norm[2:].rstrip("\\")
+        return norm
+    if os.name == "nt" and _is_posix_abs(s):
+        return posixpath.normpath(unicodedata.normalize("NFC", s))
+    nfc = unicodedata.normalize("NFC", s)
+    return unicodedata.normalize("NFC", os.path.realpath(os.path.abspath(nfc)))
+
+
+def check_case_collisions(rel_paths) -> list:
+    """Return sorted (p1, p2) pairs where NFC '/'-normalized p1 != p2 collide under casefold()."""
+    buckets = {}
+    for raw in rel_paths or []:
+        if not raw:
+            continue
+        s = unicodedata.normalize("NFC", str(raw)).replace("\\", "/")
+        s = re.sub(r"/+", "/", s)
+        while s.startswith("./"):
+            s = s[2:]
+        s = s.strip("/")
+        if not s:
+            continue
+        buckets.setdefault(s.casefold(), set()).add(s)
+    pairs = []
+    for group in buckets.values():
+        if len(group) > 1:
+            items = sorted(group)
+            for i in range(len(items)):
+                for j in range(i + 1, len(items)):
+                    pairs.append((items[i], items[j]))
+    pairs.sort()
+    return pairs
+
+
+def check_windows_path_issues(rel_paths) -> list:
+    """Return (rel_path, reason_zh) for paths violating Windows filename rules."""
+    issues = []
+    for raw in rel_paths or []:
+        if not raw:
+            continue
+        s = unicodedata.normalize("NFC", str(raw)).replace("\\", "/")
+        s = re.sub(r"/+", "/", s)
+        while s.startswith("./"):
+            s = s[2:]
+        s = s.lstrip("/").rstrip("/")
+        if not s:
+            continue
+        reasons = []
+        for comp in s.split("/"):
+            if not comp or comp in (".", ".."):
+                continue
+            bad_chars = sorted(set(ch for ch in comp if ch in _WIN_INVALID_CHARS))
+            has_ctrl = any(ord(ch) < 32 for ch in comp)
+            if bad_chars:
+                reasons.append("路径组件「%s」包含 Windows 非法字符（%s）" % (comp, "".join(bad_chars)))
+            if has_ctrl:
+                reasons.append("路径组件「%s」包含控制字符" % comp)
+            if comp.endswith(" ") or comp.endswith("."):
+                reasons.append("路径组件「%s」不能以空格或句点结尾" % comp)
+            stem = comp.split(".", 1)[0].rstrip(" ").upper()
+            if stem in _WIN_RESERVED_NAMES:
+                reasons.append("路径组件「%s」使用了 Windows 保留设备名（%s）" % (comp, stem))
+        if reasons:
+            issues.append((s, "；".join(reasons)))
+    return issues
+
+
 def _norm_path(p):
-    return os.path.normcase(os.path.abspath(p))
+    c = canonical_local_path(p)
+    if not c:
+        return ""
+    if os.name == "nt" and not _is_posix_abs(c):
+        return os.path.normcase(c)
+    return c
 
 
 def _project_dirs(p):
@@ -267,11 +392,13 @@ def _project_dirs(p):
 
 
 def _inside(child, parent):
-    child, parent = _norm_path(child), _norm_path(parent)
-    if child == parent:
+    c, p = _norm_path(child), _norm_path(parent)
+    if not c or not p:
+        return False
+    if c == p:
         return True
-    sep = os.sep
-    return child.startswith(parent.rstrip(sep) + sep)
+    sep = "\\" if _is_win_path(p) else "/"
+    return c.startswith(p.rstrip(sep) + sep)
 
 
 def find_project(ledger, key=None, cwd=None):
@@ -389,6 +516,16 @@ def local_os():
     return "linux"
 
 
+def _load_identity():
+    f = local_dir() / "identity.json"
+    try:
+        with open(str(f), "r", encoding="utf-8-sig") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def here(ledger, local=None):
     """Device id of this machine, or None."""
     devices = ledger["config"]["devices"]
@@ -396,15 +533,33 @@ def here(ledger, local=None):
     env = os.environ.get("RELAY_DESK_DEVICE")
     if env and env in ids:
         return env
-    local = load_local() if local is None else local
+    local_was_none = local is None
+    local = load_local() if local_was_none else local
     if local.get("device") in ids:
         return local["device"]
+    local_dev_id = local.get("deviceId")
+    if local_dev_id:
+        by_did = [d for d in devices if d.get("deviceId") == local_dev_id]
+        if len(by_did) == 1:
+            return by_did[0]["id"]
+    if local_was_none:
+        ident = _load_identity()
+        ident_did = ident.get("deviceId")
+        if ident_did:
+            by_did = [d for d in devices if d.get("deviceId") == ident_did]
+            if len(by_did) == 1:
+                return by_did[0]["id"]
+        if ident.get("alias") in ids:
+            return ident["alias"]
     host = hostname().lower()
     short = host.split(".")[0]
+    host_match = []
     for d in devices:
         h = str(d.get("host") or "").strip().lower()
         if h and (h == host or h == short):
-            return d["id"]
+            host_match.append(d)
+    if len(host_match) == 1:
+        return host_match[0]["id"]
     me = local_os()
     match = [d for d in devices if d.get("os") == me]
     if len(match) == 1:

@@ -151,6 +151,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     return self._get_index()
                 if path == "/api/ledger":
                     return self._get_ledger(parse_qs(parts.query))
+                if path == "/api/cloud/status":
+                    return self._get_cloud_status()
+                if path == "/api/cloud/inbox":
+                    return self._get_cloud_inbox()
+                if path == "/api/cloud/transcripts":
+                    return self._get_cloud_transcripts(parse_qs(parts.query))
+            elif self.command == "POST":
+                if path == "/api/cloud/pair":
+                    return self._post_cloud_pair()
+                if path == "/api/cloud/send":
+                    return self._post_cloud_send()
+                if path == "/api/cloud/receive":
+                    return self._post_cloud_receive()
             elif self.command == "PUT":
                 if path == "/api/config":
                     return self._put_config()
@@ -265,6 +278,185 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
         _, rev = self.server.store.update(fn)
         self._json(200, {"rev": rev})
+
+    # ---- cloud relay routes ----
+    def _run_cloud(self, fn, mutating=False):
+        from . import ledger as L
+        from . import relay_engine
+
+        store = self.server.store
+        led_path = getattr(store, "ledger_path", None) or getattr(store, "path", None)
+        using_bridge = False
+        if led_path is None:
+            using_bridge = True
+            bridge = L.local_dir() / "_mem_store_ledger.json"
+            mem_led, _ = store.read()
+            L.save(bridge, L._normalize(mem_led))
+            led_path = bridge
+
+        try:
+            res = fn(relay_engine, led_path)
+        except Exception as e:
+            return self._handle_cloud_error(e, relay_engine)
+
+        if using_bridge and mutating:
+            updated = L.load(led_path)
+
+            def _sync_mem(ledger):
+                ledger.clear()
+                ledger["config"] = updated.get("config", {})
+                ledger["projects"] = updated.get("projects", [])
+
+            store.update(_sync_mem)
+        return self._json(200, res)
+
+    def _handle_cloud_error(self, e, relay_engine):
+        cls_name = e.__class__.__name__
+        code_attr = getattr(e, "code", "")
+        if isinstance(e, relay_engine.NeedTargetPathError) or code_attr == "need_path":
+            return self._json(
+                409,
+                {
+                    "error": str(e),
+                    "code": "need_path",
+                    "projectId": getattr(e, "project_id", ""),
+                    "projectName": getattr(e, "project_name", ""),
+                },
+            )
+        if cls_name == "TargetDirtyError" or code_attr == "target_dirty":
+            return self._json(
+                409,
+                {
+                    "error": str(e),
+                    "code": "target_dirty",
+                    "projectId": getattr(e, "project_id", ""),
+                    "projectName": getattr(e, "project_name", ""),
+                    "targetPath": getattr(e, "target_path", ""),
+                    "reasons": getattr(e, "reasons", []),
+                },
+            )
+        if isinstance(e, relay_engine.DuplicateReceiveError) or code_attr == "duplicate_receive":
+            return self._json(
+                409,
+                {
+                    "error": str(e),
+                    "code": "duplicate_receive",
+                    "relayId": getattr(e, "relay_id", ""),
+                },
+            )
+        if isinstance(e, relay_engine.ReceiptUploadError) or code_attr == "receipt_upload_failed":
+            return self._json(
+                409,
+                {
+                    "error": str(e),
+                    "code": "receipt_upload_failed",
+                    "relayId": getattr(e, "relay_id", ""),
+                },
+            )
+        if isinstance(e, LookupError) or cls_name == "ObjectNotFoundError":
+            return self._json(404, {"error": str(e), "code": "not_found"})
+        if hasattr(e, "gaps"):
+            return self._json(
+                400,
+                {"error": str(e), "code": "conversation_gap", "gaps": getattr(e, "gaps", [])},
+            )
+        if hasattr(e, "findings"):
+            return self._json(
+                400,
+                {"error": str(e), "code": "secret_leak", "findings": getattr(e, "findings", [])},
+            )
+        if hasattr(e, "conflicts"):
+            return self._json(
+                400,
+                {"error": str(e), "code": "path_conflict", "conflicts": getattr(e, "conflicts", [])},
+            )
+        mod_name = getattr(e.__class__, "__module__", "") or ""
+        if mod_name.startswith("relaydesk."):
+            return self._json(400, {"error": str(e), "code": code_attr or cls_name})
+        raise e
+
+    def _read_json_obj(self):
+        ok, body = self._read_json()
+        if not ok:
+            return False, None
+        if not isinstance(body, dict):
+            self._err(400, "body must be an object")
+            return False, None
+        return True, body
+
+    def _get_cloud_status(self):
+        return self._run_cloud(
+            lambda eng, lp: eng.cloud_status(ledger_path=lp),
+            mutating=False,
+        )
+
+    def _post_cloud_pair(self):
+        ok, body = self._read_json_obj()
+        if not ok:
+            return
+        return self._run_cloud(
+            lambda eng, lp: eng.pair_device(
+                remote=body.get("remote"),
+                root=body.get("root"),
+                provider_type=body.get("provider"),
+                rclone_config=body.get("configPath") or body.get("rcloneConfig"),
+                accept=bool(body.get("accept")),
+                ledger_path=lp,
+            ),
+            mutating=True,
+        )
+
+    def _get_cloud_inbox(self):
+        return self._run_cloud(
+            lambda eng, lp: eng.list_inbox(ledger_path=lp),
+            mutating=True,
+        )
+
+    def _post_cloud_send(self):
+        ok, body = self._read_json_obj()
+        if not ok:
+            return
+        return self._run_cloud(
+            lambda eng, lp: eng.send_project(
+                project_key=body.get("project") or body.get("projectId"),
+                to_alias=body.get("to"),
+                ledger_path=lp,
+            ),
+            mutating=True,
+        )
+
+    def _post_cloud_receive(self):
+        ok, body = self._read_json_obj()
+        if not ok:
+            return
+        relay_id = body.get("relayId") or body.get("relay_id") or body.get("id")
+        if not isinstance(relay_id, str) or not relay_id.strip():
+            return self._err(400, "missing relayId")
+        return self._run_cloud(
+            lambda eng, lp: eng.receive_relay(
+                relay_id.strip(),
+                target_path=body.get("path") or None,
+                into_path=body.get("into") or None,
+                ledger_path=lp,
+            ),
+            mutating=True,
+        )
+
+    def _get_cloud_transcripts(self, query):
+        project = query.get("project", [None])[0]
+        session = query.get("session", [None])[0]
+        tool = query.get("tool", [None])[0]
+        grep = query.get("q", [None])[0] or query.get("grep", [None])[0]
+        return self._run_cloud(
+            lambda eng, lp: eng.query_transcripts(
+                project_key=project,
+                session_id=session,
+                tool=tool,
+                grep=grep,
+                ledger_path=lp,
+            ),
+            mutating=False,
+        )
 
 
 def make_server(html_path, store, port=0):

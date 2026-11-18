@@ -261,5 +261,198 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(self.srv.server_address[0], "127.0.0.1")
 
 
+class CloudServerApiTest(unittest.TestCase):
+    PAGE = u"<div id=app>cloud server test</div>"
+
+    def setUp(self):
+        from unittest import mock
+        from pathlib import Path
+        from relaydesk import cli
+        from relaydesk import ledger as L
+
+        self.mock = mock
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cloud = self.root / "cloud"
+        self.cloud.mkdir()
+
+        self.html = str(self.root / "page.html")
+        with open(self.html, "w", encoding="utf-8") as f:
+            f.write(self.PAGE)
+
+        self.home_a = self.root / "home_a"
+        self.uhome_a = self.root / "uhome_a"
+        self.led_a = self.root / "led_a.json"
+        self.home_b = self.root / "home_b"
+        self.uhome_b = self.root / "uhome_b"
+        self.led_b = self.root / "led_b.json"
+
+        for d in (self.home_a, self.uhome_a, self.home_b, self.uhome_b):
+            d.mkdir(parents=True, exist_ok=True)
+        (self.home_a / "config.json").write_text(json.dumps({"device": "a", "ledger": str(self.led_a)}), encoding="utf-8")
+        (self.home_b / "config.json").write_text(json.dumps({"device": "b", "ledger": str(self.led_b)}), encoding="utf-8")
+        L.update(self.led_a, lambda _l: None)
+        L.update(self.led_b, lambda _l: None)
+
+        self.srv_a = server.make_server(self.html, cli._FileStore(self.led_a), 0)
+        self.port_a = self.srv_a.server_address[1]
+        self.th_a = threading.Thread(target=self.srv_a.serve_forever, daemon=True)
+        self.th_a.start()
+        self.addCleanup(self.srv_a.server_close)
+        self.addCleanup(self.srv_a.shutdown)
+
+        self.srv_b = server.make_server(self.html, cli._FileStore(self.led_b), 0)
+        self.port_b = self.srv_b.server_address[1]
+        self.th_b = threading.Thread(target=self.srv_b.serve_forever, daemon=True)
+        self.th_b.start()
+        self.addCleanup(self.srv_b.server_close)
+        self.addCleanup(self.srv_b.shutdown)
+
+    def _call(self, dev, method, path, body=None, headers=None):
+        port = self.port_a if dev == "a" else self.port_b
+        home = self.home_a if dev == "a" else self.home_b
+        uhome = self.uhome_a if dev == "a" else self.uhome_b
+        led = self.led_a if dev == "a" else self.led_b
+        env = {
+            "RELAY_DESK_HOME": str(home),
+            "RELAY_DESK_LEDGER": str(led),
+            "RELAY_DESK_DEVICE": dev,
+            "RELAY_DESK_USER_HOME": str(uhome),
+        }
+        h = {"Host": "127.0.0.1:%d" % port}
+        if method != "GET":
+            h["X-Relay-Desk"] = "1"
+        if headers:
+            h.update(headers)
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            h.setdefault("Content-Type", "application/json")
+        with self.mock.patch.dict(os.environ, env):
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+            try:
+                c.putrequest(method, path, skip_host=True)
+                for k, v in h.items():
+                    if v is not None:
+                        c.putheader(k, v)
+                if data is not None:
+                    c.putheader("Content-Length", str(len(data)))
+                c.endheaders(data)
+                r = c.getresponse()
+                raw = r.read()
+                return r.status, (json.loads(raw.decode("utf-8")) if raw else None)
+            finally:
+                c.close()
+
+    def test_cloud_http_routes_and_409_conflict_codes(self):
+        from relaydesk import ledger as L
+        from relaydesk import scan
+
+        # Guard check on POST /api/cloud/pair without X-Relay-Desk header
+        st_403, _ = self._call("a", "POST", "/api/cloud/pair", {"accept": False}, headers={"X-Relay-Desk": None})
+        self.assertEqual(st_403, 403)
+
+        st, d0 = self._call("a", "GET", "/api/cloud/status")
+        self.assertEqual(st, 200)
+        self.assertFalse(d0["configured"])
+
+        # Pair A and B via HTTP API
+        st, pa1 = self._call("a", "POST", "/api/cloud/pair", {"provider": "local", "root": str(self.cloud), "accept": False})
+        self.assertEqual(st, 200)
+        self.assertFalse(pa1["paired"])
+
+        st, pb1 = self._call("b", "POST", "/api/cloud/pair", {"provider": "local", "root": str(self.cloud), "accept": True})
+        self.assertEqual(st, 200)
+        self.assertTrue(pb1["paired"])
+
+        st, pa2 = self._call("a", "POST", "/api/cloud/pair", {"accept": True})
+        self.assertEqual(st, 200)
+        self.assertTrue(pa2["paired"])
+        self.assertEqual(pa2["pairFingerprint"], pb1["pairFingerprint"])
+
+        # Register folder project + session on A
+        proj_a = self.root / "web_proj_a"
+        proj_a.mkdir()
+        (proj_a / "index.js").write_text("console.log(1);\n", encoding="utf-8")
+
+        def _add_p(l):
+            l["projects"].append(
+                L.norm_project(
+                    {
+                        "id": "web-demo",
+                        "name": "Web 工作台项目",
+                        "device": "a",
+                        "lastTask": "完成前端",
+                        "nextAction": "联调接口",
+                        "paths": {"a": str(proj_a), "b": ""},
+                    },
+                    l["config"],
+                )
+            )
+
+        L.update(self.led_a, _add_p)
+        cdir = self.uhome_a / ".claude" / "projects" / scan.enc_path(str(proj_a))
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "s_web_1.jsonl").write_text(
+            json.dumps({"type": "user", "message": {"role": "user", "content": "HTTP_QUERY_TOKEN"}}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        # POST /api/cloud/send on A
+        st, send_res = self._call("a", "POST", "/api/cloud/send", {"project": "web-demo", "to": "b"})
+        self.assertEqual(st, 200)
+        self.assertTrue(send_res["ok"])
+        self.assertEqual(send_res["message"], "已交棒，可以关机")
+        rid1 = send_res["relayId"]
+
+        # GET /api/cloud/inbox on B
+        st, ib_b = self._call("b", "GET", "/api/cloud/inbox")
+        self.assertEqual(st, 200)
+        self.assertEqual(len(ib_b["incoming"]), 1)
+        self.assertEqual(ib_b["incoming"][0]["projectName"], "Web 工作台项目")
+
+        # POST /api/cloud/receive without path -> 409 need_path!
+        st, err_np = self._call("b", "POST", "/api/cloud/receive", {"relayId": rid1})
+        self.assertEqual(st, 409)
+        self.assertEqual(err_np["code"], "need_path")
+        self.assertEqual(err_np["projectName"], "Web 工作台项目")
+
+        # POST /api/cloud/receive with path -> 200!
+        proj_b = self.root / "web_proj_b"
+        st, recv1 = self._call("b", "POST", "/api/cloud/receive", {"relayId": rid1, "path": str(proj_b)})
+        self.assertEqual(st, 200)
+        self.assertTrue(recv1["ok"])
+        self.assertEqual((proj_b / "index.js").read_text(encoding="utf-8"), "console.log(1);\n")
+
+        # GET /api/cloud/transcripts on B
+        st, tr_b = self._call("b", "GET", "/api/cloud/transcripts?project=web-demo&q=HTTP_QUERY_TOKEN")
+        self.assertEqual(st, 200)
+        self.assertGreaterEqual(len(tr_b["matches"]), 1)
+        st, tr_md = self._call("b", "GET", "/api/cloud/transcripts?project=web-demo&session=s_web_1")
+        self.assertEqual(st, 200)
+        self.assertIn("HTTP_QUERY_TOKEN", tr_md["markdown"])
+
+        # Send back from B, modify proj_a locally so A gets 409 target_dirty, then recover with `into`!
+        (proj_b / "index.js").write_text("console.log(2);\n", encoding="utf-8")
+        st, send2 = self._call("b", "POST", "/api/cloud/send", {"project": "web-demo", "to": "a"})
+        self.assertEqual(st, 200)
+        rid2 = send2["relayId"]
+
+        (proj_a / "index.js").write_text("console.log('dirty local A');\n", encoding="utf-8")
+        st, err_dirty = self._call("a", "POST", "/api/cloud/receive", {"relayId": rid2})
+        self.assertEqual(st, 409)
+        self.assertEqual(err_dirty["code"], "target_dirty")
+        self.assertEqual(err_dirty["projectName"], "Web 工作台项目")
+        self.assertEqual((proj_a / "index.js").read_text(encoding="utf-8"), "console.log('dirty local A');\n")
+
+        proj_a_into = self.root / "web_proj_a_into"
+        st, recv2 = self._call("a", "POST", "/api/cloud/receive", {"relayId": rid2, "into": str(proj_a_into)})
+        self.assertEqual(st, 200)
+        self.assertTrue(recv2["ok"])
+        self.assertEqual((proj_a_into / "index.js").read_text(encoding="utf-8"), "console.log(2);\n")
+        self.assertEqual((proj_a / "index.js").read_text(encoding="utf-8"), "console.log('dirty local A');\n")
+
+
 if __name__ == "__main__":
     unittest.main()

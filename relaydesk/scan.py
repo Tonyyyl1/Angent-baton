@@ -5,11 +5,21 @@ credential files (existence checks only).
 """
 import datetime
 import json
+import ntpath
 import os
+import posixpath
 import re
 import subprocess
+import unicodedata
 from pathlib import Path
 from urllib.parse import unquote
+
+
+_WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _is_win_path(s):
+    return bool(_WIN_DRIVE_RE.match(s) or s.startswith("\\\\"))
 
 
 def _home(home):
@@ -19,6 +29,56 @@ def _home(home):
 def enc_path(p):
     """Claude Code project-directory encoding: every non [A-Za-z0-9] char becomes '-'."""
     return re.sub(r"[^A-Za-z0-9]", "-", str(p))
+
+
+def _claude_enc_candidates(cwd):
+    """Return deduplicated enc_path candidates across raw, NFC/NFD, and realpath aliases."""
+    raw = str(cwd or "")
+    if not raw:
+        return []
+    nfc = unicodedata.normalize("NFC", raw)
+    nfd = unicodedata.normalize("NFD", raw)
+    variants = [raw, nfc, nfd]
+    is_foreign = (os.name != "nt" and _is_win_path(raw)) or (
+        os.name == "nt" and raw.startswith("/") and not raw.startswith("//")
+    )
+    if not is_foreign:
+        for base in (raw, nfc):
+            try:
+                rp = os.path.realpath(base)
+            except OSError:
+                rp = ""
+            if rp:
+                variants.append(rp)
+                variants.append(unicodedata.normalize("NFC", rp))
+                variants.append(unicodedata.normalize("NFD", rp))
+        if os.name != "nt":
+            for v in list(variants):
+                for link_prefix, real_prefix in (("/var/", "/private/var/"), ("/tmp/", "/private/tmp/")):
+                    if v.startswith(real_prefix):
+                        try:
+                            if os.path.realpath(link_prefix.rstrip("/")) == real_prefix.rstrip("/"):
+                                alias = link_prefix + v[len(real_prefix):]
+                                variants.append(alias)
+                                variants.append(unicodedata.normalize("NFC", alias))
+                                variants.append(unicodedata.normalize("NFD", alias))
+                        except OSError:
+                            pass
+    out = []
+    seen = set()
+    for v in variants:
+        if len(v) > 1 and v.endswith(("/", "\\")) and not re.match(r"^[A-Za-z]:[\\/]$", v):
+            v_trimmed = v.rstrip("/\\")
+        else:
+            v_trimmed = v
+        for cand in (v, v_trimmed):
+            if not cand:
+                continue
+            ep = enc_path(cand)
+            if ep and ep not in seen:
+                seen.add(ep)
+                out.append(ep)
+    return out
 
 
 # ---------------------------------------------------------------- git
@@ -101,7 +161,10 @@ def presence(path, home=None):
     h = _home(home)
     p = Path(path)
     ex = os.path.exists
-    memory = h / ".claude" / "projects" / enc_path(path) / "memory"
+    cc_memory = any(
+        _nonempty_dir(h / ".claude" / "projects" / ep / "memory")
+        for ep in _claude_enc_candidates(path)
+    )
     out = {
         "claudeMd": ex(p / "CLAUDE.md"),
         "claudeLocal": ex(p / "CLAUDE.local.md"),
@@ -110,7 +173,7 @@ def presence(path, home=None):
         "ccSettingsLocal": ex(p / ".claude" / "settings.local.json"),
         "ccCmdAgents": os.path.isdir(str(p / ".claude" / "commands"))
         or os.path.isdir(str(p / ".claude" / "agents")),
-        "ccMemory": _nonempty_dir(memory),
+        "ccMemory": cc_memory,
         "mcpJson": ex(p / ".mcp.json"),
         "agentsMd": ex(p / "AGENTS.md"),
         "cxProject": os.path.isdir(str(p / ".codex")),
@@ -204,33 +267,39 @@ def _claude_title(fp):
 def claude_sessions(cwd_paths, home=None):
     h = _home(home)
     root = h / ".claude" / "projects"
-    out = []
-    seen = set()
+    by_id = {}
     for cwd in cwd_paths or []:
         if not cwd:
             continue
-        d = root / enc_path(cwd)
-        try:
-            names = os.listdir(str(d))
-        except OSError:
-            continue
-        for n in names:
-            if not n.endswith(".jsonl"):
-                continue
-            fp = d / n
-            key = (cwd, n)
-            if key in seen:
-                continue
+        for ep in _claude_enc_candidates(cwd):
+            d = root / ep
             try:
-                if not fp.is_file():
-                    continue
-                mt = fp.stat().st_mtime
+                names = os.listdir(str(d))
             except OSError:
                 continue
-            seen.add(key)
-            out.append({"tool": "claude", "sessionId": n[:-len(".jsonl")],
-                        "title": _claude_title(str(fp)), "cwd": cwd,
-                        "lastUsed": _date_of(mt), "mtime": mt})
+            for n in names:
+                if not n.endswith(".jsonl"):
+                    continue
+                sid = n[:-len(".jsonl")]
+                fp = d / n
+                try:
+                    if not fp.is_file():
+                        continue
+                    mt = fp.stat().st_mtime
+                except OSError:
+                    continue
+                prev = by_id.get(sid)
+                if prev is not None and prev["mtime"] >= mt:
+                    continue
+                by_id[sid] = {
+                    "tool": "claude",
+                    "sessionId": sid,
+                    "title": _claude_title(str(fp)),
+                    "cwd": cwd,
+                    "lastUsed": _date_of(mt),
+                    "mtime": mt,
+                }
+    out = list(by_id.values())
     out.sort(key=lambda s: s["mtime"], reverse=True)
     return out
 
@@ -240,17 +309,40 @@ _CWD_RE = re.compile(r'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
 
 def _norm(p):
-    p = str(p).replace("\\", "/")
-    while len(p) > 1 and p.endswith("/"):
-        p = p[:-1]
-    if os.name == "nt" or re.match(r"^[A-Za-z]:/", p):
-        p = p.lower()
-    return p
+    if not p:
+        return ""
+    s = str(p)
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFC", s)
+    if os.name != "nt":
+        if _is_win_path(s):
+            norm = ntpath.normpath(s).replace("\\", "/").lower()
+            if norm.startswith("//") and len(norm) > 2:
+                norm = "//" + norm[2:].rstrip("/")
+            return norm
+        if s.startswith("/"):
+            return unicodedata.normalize("NFC", os.path.realpath(s))
+        s = s.replace("\\", "/")
+        while len(s) > 1 and s.endswith("/"):
+            s = s[:-1]
+        return s
+    if s.startswith("/") and not s.startswith("//"):
+        return posixpath.normpath(s)
+    if _is_win_path(s):
+        real = unicodedata.normalize("NFC", os.path.realpath(s)).replace("\\", "/").lower()
+        while len(real) > 1 and real.endswith("/") and not re.match(r"^[a-z]:/$", real):
+            real = real[:-1]
+        return real
+    s = s.replace("\\", "/")
+    while len(s) > 1 and s.endswith("/"):
+        s = s[:-1]
+    return s.lower()
 
 
 def _within(cwd, base):
     c, b = _norm(cwd), _norm(base)
-    if not b:
+    if not c or not b:
         return False
     if c == b:
         return True

@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 
@@ -492,6 +493,117 @@ class AntiSessions(Tmp):
         self.assertEqual(len(r), 1)
         self.assertEqual(r[0]["title"], "手动重命名会话")
         self.assertEqual(r[0]["mtime"], 1_800_000_000)
+
+
+class CrossPlatformAndSymlinkScan(Tmp):
+    U1 = "01bbbbbb-0000-4000-8000-000000000001"
+    U2 = "01bbbbbb-0000-4000-8000-000000000002"
+    U3 = "01bbbbbb-0000-4000-8000-000000000003"
+    A1 = "22222222-3333-4444-8555-666666666666"
+    A2 = "33333333-4444-4555-8666-777777777777"
+
+    def setUp(self):
+        super().setUp()
+        self.home = os.path.join(self.tmp, "home")
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlinks and /var <-> /private/var")
+    def test_claude_codex_anti_and_presence_across_symlinks_and_var_aliases(self):
+        real_proj = os.path.join(self.tmp, "real_workspace", "双机项目")
+        os.makedirs(real_proj, exist_ok=True)
+        link_proj = os.path.join(self.tmp, "link_workspace")
+        os.symlink(real_proj, link_proj)
+
+        # 1. Claude session & memory stored under realpath, queried via symlink (and deduplicated)
+        real_cc_dir = os.path.join(self.home, ".claude", "projects", scan.enc_path(real_proj))
+        link_cc_dir = os.path.join(self.home, ".claude", "projects", scan.enc_path(link_proj))
+        write(os.path.join(real_cc_dir, "s_sym.jsonl"), json.dumps({"customTitle": "新标题"}) + "\n")
+        os.utime(os.path.join(real_cc_dir, "s_sym.jsonl"), (1_800_000_010, 1_800_000_010))
+        write(os.path.join(link_cc_dir, "s_sym.jsonl"), json.dumps({"customTitle": "旧标题"}) + "\n")
+        os.utime(os.path.join(link_cc_dir, "s_sym.jsonl"), (1_700_000_010, 1_700_000_010))
+        write(os.path.join(real_cc_dir, "memory", "MEMORY.md"), "remember")
+
+        cc = scan.claude_sessions([link_proj], home=self.home)
+        self.assertEqual(len(cc), 1)
+        self.assertEqual(cc[0]["sessionId"], "s_sym")
+        self.assertEqual(cc[0]["title"], "新标题")
+        self.assertEqual(cc[0]["cwd"], link_proj)
+        self.assertTrue(scan.presence(link_proj, home=self.home)["ccMemory"])
+
+        # Also test /var <-> /private/var and /tmp <-> /private/tmp reverse lookup for Claude
+        if os.path.realpath("/tmp") == "/private/tmp":
+            var_style = "/tmp/fake_claude_alias_proj"
+            priv_style = "/private/tmp/fake_claude_alias_proj"
+            write(os.path.join(self.home, ".claude", "projects", scan.enc_path(var_style), "s_tmp.jsonl"),
+                  json.dumps({"aiTitle": "tmp别名"}) + "\n")
+            found_from_priv = scan.claude_sessions([priv_style], home=self.home)
+            self.assertEqual([s["sessionId"] for s in found_from_priv], ["s_tmp"])
+
+        # 2. Codex session recorded under realpath, queried via symlink
+        roll = os.path.join(self.home, ".codex", "sessions", "2026", "11", "08",
+                            "rollout-2026-11-08T10-00-00-%s.jsonl" % self.U1)
+        write(roll, json.dumps({"type": "session_meta", "payload": {"id": self.U1, "cwd": os.path.join(real_proj, "sub")}}) + "\n")
+        cx = scan.codex_sessions([link_proj], home=self.home)
+        self.assertEqual([s["sessionId"] for s in cx], [self.U1])
+
+        # 3. Antigravity session recorded under realpath, queried via symlink; relative @[README.md] ignored
+        brain1 = os.path.join(self.home, ".gemini", "antigravity", "brain", self.A1, ".system_generated", "logs", "transcript.jsonl")
+        write(brain1, json.dumps({
+            "type": "USER_INPUT",
+            "metadata": {"workspacePath": real_proj},
+            "content": "<USER_REQUEST>修复软链接目录识别</USER_REQUEST>",
+        }, ensure_ascii=False) + "\n")
+        brain2 = os.path.join(self.home, ".gemini", "antigravity", "brain", self.A2, ".system_generated", "logs", "transcript.jsonl")
+        write(brain2, json.dumps({
+            "type": "USER_INPUT",
+            "content": "<USER_REQUEST>@[README.md] 相对引用不应误判为当前目录</USER_REQUEST>",
+        }, ensure_ascii=False) + "\n")
+        ag = scan.anti_sessions([link_proj, os.getcwd()], home=self.home)
+        self.assertEqual([s["sessionId"] for s in ag], [self.A1])
+        self.assertEqual(ag[0]["cwd"], real_proj)
+
+    def test_chinese_nfc_nfd_across_claude_codex_and_anti(self):
+        nfc_dir = os.path.join(self.tmp, unicodedata.normalize("NFC", "测试工作区/café_项目"))
+        nfd_dir = os.path.join(self.tmp, unicodedata.normalize("NFD", "测试工作区/café_项目"))
+        self.assertNotEqual(nfc_dir, nfd_dir)
+
+        # Claude stored under NFC, queried via NFD
+        write(os.path.join(self.home, ".claude", "projects", scan.enc_path(nfc_dir), "s_zh.jsonl"),
+              json.dumps({"customTitle": "中文NFC会话"}, ensure_ascii=False) + "\n")
+        cc = scan.claude_sessions([nfd_dir], home=self.home)
+        self.assertEqual([s["sessionId"] for s in cc], ["s_zh"])
+        self.assertEqual(cc[0]["title"], "中文NFC会话")
+
+        # Codex stored under NFD, queried via NFC
+        roll = os.path.join(self.home, ".codex", "sessions", "2026", "11", "09",
+                            "rollout-2026-11-09T10-00-00-%s.jsonl" % self.U2)
+        write(roll, json.dumps({"type": "session_meta", "payload": {"id": self.U2, "cwd": nfd_dir}}, ensure_ascii=False) + "\n")
+        cx = scan.codex_sessions([nfc_dir], home=self.home)
+        self.assertEqual([s["sessionId"] for s in cx], [self.U2])
+
+        # Antigravity stored under NFD, queried via NFC
+        brain = os.path.join(self.home, ".gemini", "antigravity", "brain", self.A1, ".system_generated", "logs", "transcript.jsonl")
+        write(brain, json.dumps({
+            "type": "USER_INPUT",
+            "cwd": nfd_dir,
+            "content": "<USER_REQUEST>中文NFD路径会话</USER_REQUEST>",
+        }, ensure_ascii=False) + "\n")
+        ag = scan.anti_sessions([nfc_dir], home=self.home)
+        self.assertEqual([s["sessionId"] for s in ag], [self.A1])
+
+    def test_windows_paths_on_posix_in_codex_and_within(self):
+        self.assertTrue(scan._within(r"d:/work/proj/sub", r"D:\Work\Proj"))
+        self.assertFalse(scan._within(r"D:\Work\ProjOther", r"D:\Work\Proj"))
+        r1 = os.path.join(self.home, ".codex", "sessions", "2026", "11", "10",
+                          "rollout-2026-11-10T10-00-00-%s.jsonl" % self.U1)
+        r2 = os.path.join(self.home, ".codex", "sessions", "2026", "11", "10",
+                          "rollout-2026-11-10T10-00-00-%s.jsonl" % self.U2)
+        r3 = os.path.join(self.home, ".codex", "sessions", "2026", "11", "10",
+                          "rollout-2026-11-10T10-00-00-%s.jsonl" % self.U3)
+        write(r1, json.dumps({"type": "session_meta", "payload": {"id": self.U1, "cwd": r"d:/work/proj/sub"}}) + "\n")
+        write(r2, json.dumps({"type": "session_meta", "payload": {"id": self.U2, "cwd": r"D:\Work\Proj"}}) + "\n")
+        write(r3, json.dumps({"type": "session_meta", "payload": {"id": self.U3, "cwd": r"D:\Work\ProjOther"}}) + "\n")
+        ids = {s["sessionId"] for s in scan.codex_sessions([r"D:\Work\Proj"], home=self.home)}
+        self.assertEqual(ids, {self.U1, self.U2})
 
 
 if __name__ == "__main__":

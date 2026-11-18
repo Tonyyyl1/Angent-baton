@@ -101,6 +101,7 @@ textarea.inp{min-height:68px;resize:vertical;line-height:1.5}
 .tab:hover{color:var(--ink)}
 .tab[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--ink)}
 .tab .n{font-family:var(--font-mono);font-size:11px;margin-left:5px;color:var(--faint)}
+.tab .n.hot{background:var(--native-bg);color:var(--native);border-radius:999px;padding:1px 7px;font-weight:600}
 .filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .filters .inp{width:auto;flex:0 1 150px}
 .filters #f-q{flex:1 1 200px}
@@ -219,6 +220,25 @@ dialog::backdrop{background:var(--shade)}
 .form-grid .span2{grid-column:1/-1}
 #toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--ink);color:var(--bg);border-radius:8px;padding:8px 14px;font-size:13px;z-index:30;max-width:calc(100vw - 32px)}
 
+/* 云接力、待接棒与历史对话查阅 */
+.banner-ok{border:1.5px solid var(--native);background:var(--native-bg);color:var(--ink);border-radius:10px;padding:13px 16px;display:flex;flex-direction:column;gap:7px}
+.banner-ok h4{color:var(--native);font-size:17px;font-weight:700}
+.cloud-card{border:1.5px solid var(--line-strong);border-radius:12px;background:var(--surface);padding:16px 18px;display:flex;flex-direction:column;gap:12px;min-width:0}
+.cloud-card.paired{border-color:var(--native)}
+.fp-box{border:1px dashed var(--line-strong);border-radius:8px;padding:10px 12px;background:var(--sunken);display:flex;flex-direction:column;gap:4px}
+.fp-code{font-family:var(--font-mono);font-size:14.5px;font-weight:600;letter-spacing:.05em;overflow-wrap:anywhere}
+.inbox-list{display:flex;flex-direction:column;gap:12px}
+.inbox-item{border:1px solid var(--line-strong);border-radius:10px;padding:14px 16px;background:var(--surface);display:flex;flex-direction:column;gap:10px}
+.tx-dlg{width:min(980px,calc(100vw - 24px))}
+.tx-layout{display:grid;grid-template-columns:minmax(220px,290px) minmax(0,1fr);gap:12px;min-height:360px;max-height:calc(100dvh - 200px)}
+.tx-side{border:1px solid var(--line);border-radius:8px;overflow-y:auto;display:flex;flex-direction:column;background:var(--surface)}
+.tx-sbtn{appearance:none;border:0;border-bottom:1px solid var(--line);background:none;padding:9px 11px;text-align:left;cursor:pointer;display:flex;flex-direction:column;gap:3px}
+.tx-sbtn:last-child{border-bottom:0}
+.tx-sbtn:hover,.tx-sbtn[aria-current="true"]{background:var(--sunken)}
+.tx-main{border:1px solid var(--line);border-radius:8px;padding:12px 14px;overflow-y:auto;background:var(--sunken);display:flex;flex-direction:column;gap:10px;min-width:0}
+.tx-md{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.65 var(--font-mono)}
+.tx-hit{border:1px solid var(--line-strong);border-radius:8px;padding:8px 10px;background:var(--surface);display:flex;flex-direction:column;gap:4px}
+
 @media (max-width:980px){
   .phead{display:none}
   .prow-main{grid-template-columns:repeat(2,minmax(0,1fr))}
@@ -230,6 +250,8 @@ dialog::backdrop{background:var(--shade)}
   .track{grid-template-columns:minmax(0,1fr)}
   .transit{border-inline:0;border-block:1px dashed var(--line-strong)}
   .pd-actions .upd{margin-left:0;width:100%}
+  .tx-layout{grid-template-columns:minmax(0,1fr);max-height:none}
+  .tx-side{max-height:190px}
 }
 @media (max-width:560px){
   .notes,.board,.legend,.setgrid,.form-grid{grid-template-columns:minmax(0,1fr)}
@@ -270,6 +292,7 @@ dialog::backdrop{background:var(--shade)}
   <main id="view"></main>
 </div>
 <dialog id="dlg" aria-label="编辑"></dialog>
+<dialog id="txDlg" class="tx-dlg" aria-label="历史对话全文"></dialog>
 <div id="toast" role="status" aria-live="polite" hidden></div>
 
 <script>
@@ -299,6 +322,7 @@ const toolsOf = t => TOOL_SETS[t] || ['claude'];
 const STATUS = { active: '进行中', paused: '暂停', blocked: '受阻', done: '已完成' };
 const VERIFY = { none: '未验证', pass: '通过', partial: '部分通过', fail: '未通过' };
 const TRANSPORT = {
+  cloud: ['云端加密接力', '端到端加密打包提交、暂存/未暂存改动与三端完整对话，经云端存储异步交接。'],
   remote: ['推送个人 WIP 分支', '把未提交改动提交到一条个人 WIP 分支再推送。会写入远程，命令由你确认后执行；团队仓库慎用。'],
   bundle: ['bundle 文件', '把分支和未提交改动打成一个文件放进中转目录。不碰任何远程，没有远程的项目用这个。'],
   patch: ['补丁文件', '只把未提交改动导出成补丁。要求两台设备停在同一个提交上。'],
@@ -377,7 +401,13 @@ const SESSION_MATRIX = [
 const S = {
   mode: 'loading', note: '', projects: [], config: null, projectsLoaded: false,
   here: null, view: 'projects', open: null, relayPid: null, draft: {},
-  filters: { q: '', device: '', tool: '', status: '', dirty: '' }, pending: false, cmdSeq: 0
+  filters: { q: '', device: '', tool: '', status: '', dirty: '' }, pending: false, cmdSeq: 0,
+  cloud: {
+    loaded: false, busy: false, status: null, incoming: [], inboxErr: '',
+    form: { remote: '', root: '', touched: false },
+    sending: null, lastSent: null, sendError: null, receiving: null, lastReceived: null
+  },
+  tx: { projectId: '', session: '', tool: '', q: '', loading: false, data: null, err: '' }
 };
 const CMDS = {};
 function defaultConfig() { return { devices: [{ id: 'a', name: '设备 A', os: 'windows', drop: '' }, { id: 'b', name: '设备 B', os: 'mac', drop: '' }], reg: {} }; }
@@ -451,6 +481,12 @@ const Store = (() => {
     S.mode = 'file'; fileApply(d);
     if (fileTimer) clearInterval(fileTimer);
     fileTimer = setInterval(filePoll, 3000);
+    Cloud.refresh({ inbox: true });
+  }
+  function pollNow() {
+    if (S.mode !== 'file') return Promise.resolve();
+    fileRev = null;
+    return filePoll();
   }
   async function init() {
     let ns = null;
@@ -509,7 +545,151 @@ const Store = (() => {
     old.filter(id => !S.projects.some(p => p.id === id)).forEach(id => serial('p:' + id, () => db.collection('projects').doc(id).delete()).catch(fail));
     renderAll();
   }
-  return { init, saveProject, deleteProject, saveConfig, replaceAll };
+  return { init, saveProject, deleteProject, saveConfig, replaceAll, apiReq: fileReq, pollNow };
+})();
+
+/* ---------- 云端异步接力（仅文件模式） ---------- */
+const fmtBytes = n => {
+  const v = Number(n) || 0;
+  if (v < 1024) return v + ' B';
+  if (v < 1048576) return (v / 1024).toFixed(1) + ' KB';
+  return (v / 1048576).toFixed(2) + ' MB';
+};
+const Cloud = (() => {
+  async function refresh(opts) {
+    if (S.mode !== 'file') return;
+    opts = opts || {};
+    S.cloud.busy = true;
+    try {
+      const sr = await Store.apiReq('GET', '/api/cloud/status', undefined, 10000);
+      if (sr.ok) {
+        const st = await sr.json();
+        S.cloud.status = st;
+        S.cloud.loaded = true;
+        if (!S.cloud.form.touched) {
+          S.cloud.form.remote = (st.cloud && st.cloud.remote) || (Array.isArray(st.remotes) && st.remotes[0]) || '';
+          S.cloud.form.root = (st.cloud && st.cloud.root) || '';
+        }
+        let savedHere = null; try { savedHere = localStorage.getItem('relaydesk.here'); } catch (e) {}
+        if (!savedHere && st.alias && S.config.devices.some(d => d.id === st.alias)) S.here = st.alias;
+      }
+      if (opts.inbox) {
+        const ir = await Store.apiReq('GET', '/api/cloud/inbox', undefined, 25000);
+        if (ir.ok) {
+          const ib = await ir.json();
+          S.cloud.incoming = Array.isArray(ib.incoming) ? ib.incoming : [];
+          S.cloud.inboxErr = '';
+          if (Array.isArray(ib.syncedReceipts) && ib.syncedReceipts.length > 0) await Store.pollNow();
+        } else {
+          const ed = await ir.json().catch(() => ({}));
+          if (S.cloud.status && S.cloud.status.paired) S.cloud.inboxErr = ed.error || ('读取待接棒列表失败（HTTP ' + ir.status + '）');
+          else { S.cloud.incoming = []; S.cloud.inboxErr = ''; }
+        }
+      }
+      if (opts.manual) toast('云端状态已刷新。');
+    } catch (e) {
+      if (opts.manual) toast('云端状态读取失败，请确认本机 relay serve 正在运行。');
+    } finally {
+      S.cloud.busy = false;
+      renderAll();
+    }
+  }
+  async function pair(accept) {
+    if (S.mode !== 'file') return;
+    const remEl = $('#cloud-remote'), rootEl = $('#cloud-root');
+    if (remEl) S.cloud.form.remote = remEl.value;
+    if (rootEl) S.cloud.form.root = rootEl.value;
+    const remote = S.cloud.form.remote.trim(), root = S.cloud.form.root.trim();
+    const curProv = S.cloud.status && S.cloud.status.cloud && S.cloud.status.cloud.provider;
+    if (!accept && !remote && curProv !== 'local') { toast('请先选择或输入 rclone 远端连接名。'); if (remEl) remEl.focus(); return; }
+    const body = { accept: !!accept };
+    if (remote || (!accept && curProv !== 'local')) { body.remote = remote; body.root = root; }
+    else if (root) body.root = root;
+    S.cloud.busy = true; renderAll();
+    try {
+      const r = await Store.apiReq('POST', '/api/cloud/pair', body, 60000);
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { toast(d.error || ('配对失败（HTTP ' + r.status + '）')); return; }
+      S.cloud.status = d;
+      S.cloud.loaded = true;
+      S.cloud.form.touched = false;
+      S.cloud.form.remote = (d.cloud && d.cloud.remote) || remote;
+      S.cloud.form.root = (d.cloud && d.cloud.root) || root;
+      await Store.pollNow();
+      toast(accept ? '配对指纹已确认，双机加密云接力已就绪。' : '已保存云目录并发布本机签名公钥。');
+      if (d.paired) await refresh({ inbox: true });
+    } catch (e) {
+      toast('配对请求失败，请检查 rclone 连接或本机服务状态。');
+    } finally {
+      S.cloud.busy = false;
+      renderAll();
+    }
+  }
+  async function send(pid, toAlias) {
+    if (S.mode !== 'file' || !pid) return;
+    S.cloud.sending = pid; S.cloud.sendError = null; renderAll();
+    try {
+      const body = { project: pid };
+      if (toAlias) body.to = toAlias;
+      const r = await Store.apiReq('POST', '/api/cloud/send', body, 120000);
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        S.cloud.sendError = {
+          projectId: pid,
+          error: d.error || ('加密上传交棒失败（HTTP ' + r.status + '）'),
+          gaps: Array.isArray(d.gaps) ? d.gaps : []
+        };
+        toast(S.cloud.sendError.error);
+        return;
+      }
+      S.cloud.lastSent = Object.assign({ projectId: pid }, d);
+      await Store.pollNow();
+      toast(d.message || '已交棒，可以关机');
+    } catch (e) {
+      S.cloud.sendError = { projectId: pid, error: '加密交棒请求超时或中断，重试将沿用同一交接编号。', gaps: [] };
+      toast(S.cloud.sendError.error);
+    } finally {
+      S.cloud.sending = null;
+      renderAll();
+    }
+  }
+  async function receive(relayId, opts) {
+    if (S.mode !== 'file' || !relayId) return;
+    opts = opts || {};
+    S.cloud.receiving = relayId; renderAll();
+    try {
+      const body = { relayId };
+      if (opts.path) body.path = opts.path;
+      if (opts.into) body.into = opts.into;
+      const r = await Store.apiReq('POST', '/api/cloud/receive', body, 120000);
+      const d = await r.json().catch(() => ({}));
+      S.cloud.receiving = null;
+      if (r.status === 409) {
+        const item = S.cloud.incoming.find(x => x.relayId === relayId) || { relayId, projectName: d.projectName || relayId, projectId: d.projectId || '' };
+        if (d.code === 'receipt_upload_failed') { await Store.pollNow(); await refresh({ inbox: true }); }
+        renderAll();
+        if (d.code === 'need_path') { openReceiveModal(item, 'need_path', d); return; }
+        if (d.code === 'target_dirty') { openReceiveModal(item, 'target_dirty', d); return; }
+        toast(d.error || '目标目录冲突，请检查本机目录。');
+        return;
+      }
+      if (!r.ok) {
+        renderAll();
+        toast(d.error || ('接收交接包失败（HTTP ' + r.status + '）'));
+        return;
+      }
+      const dlg = $('#dlg'); if (dlg && dlg.open) dlg.close();
+      S.cloud.lastReceived = d;
+      await Store.pollNow();
+      await refresh({ inbox: true });
+      toast(d.message || '交接包已验签恢复，签收回执已回传。');
+    } catch (e) {
+      S.cloud.receiving = null;
+      renderAll();
+      toast('接收请求中断；若本地已解包成功，再次点击即可补传回执。');
+    }
+  }
+  return { refresh, pair, send, receive };
 })();
 
 /* ---------- 设备与路径 ---------- */
@@ -596,7 +776,7 @@ function resumeLines(p, s) {
 }
 
 /* ---------- 接力：清单与命令 ---------- */
-function defaultTransport(p) { return p.transport || (!p.branch ? 'folder' : p.remote ? 'remote' : 'bundle'); }
+function defaultTransport(p) { return (p.transport && p.transport !== 'cloud' ? p.transport : '') || (!p.branch ? 'folder' : p.remote ? 'remote' : 'bundle'); }
 function planFor(p) {
   const h = p.handoff, F = dev(h.from), T = dev(h.to);
   const miss = [];
@@ -748,9 +928,11 @@ function renderChrome() {
   b.className = 'sync ' + (S.mode === 'db' || S.mode === 'file' ? 'db' : S.mode === 'local' ? 'local' : '');
   b.textContent = S.mode === 'file' ? '文件模式，Claude Code、Codex 和 Antigravity 共用这份台账' : S.mode === 'db' ? '云端保存，两台设备共用一份' : S.mode === 'local' ? '本地模式，只存在这个浏览器' : '正在连接';
   const n = $('#notice'); n.hidden = !S.note; n.textContent = S.note;
-  const nConf = S.projects.reduce((a, p) => a + p.conflicts.length, 0), nRelay = S.projects.filter(p => p.handoff).length;
-  const tabs = [['projects', '项目', S.projects.length], ['relay', '接力', nRelay], ['registry', '状态登记', ''], ['conflicts', '冲突记录', nConf], ['settings', '设置', '']];
-  $('#tabs').innerHTML = tabs.map(([v, t, c]) => `<button type="button" class="tab" role="tab" id="tab-${v}" aria-selected="${S.view === v}" data-act="tab" data-v="${v}">${t}${c !== '' ? `<span class="n">${c}</span>` : ''}</button>`).join('');
+  const nConf = S.projects.reduce((a, p) => a + p.conflicts.length, 0), nRelay = S.projects.filter(p => p.handoff).length, nInbox = S.cloud.incoming.length;
+  const tabs = [['projects', '项目', S.projects.length]]
+    .concat(S.mode === 'file' ? [['inbox', '待接棒', nInbox]] : [])
+    .concat([['relay', '接力', nRelay], ['registry', '状态登记', ''], ['conflicts', '冲突记录', nConf], ['settings', '设置', '']]);
+  $('#tabs').innerHTML = tabs.map(([v, t, c]) => `<button type="button" class="tab" role="tab" id="tab-${v}" aria-selected="${S.view === v}" data-act="tab" data-v="${v}">${t}${c !== '' ? `<span class="n ${v === 'inbox' && c > 0 ? 'hot' : ''}">${c}</span>` : ''}</button>`).join('');
   $('#filters').hidden = S.view !== 'projects';
   const fd = $('#f-device'), cur = S.filters.device;
   fd.innerHTML = '<option value="">全部设备</option>' + S.config.devices.map(d => `<option value="${esc(d.id)}">在 ${esc(d.name)}</option>`).join('');
@@ -812,7 +994,7 @@ function projectDetail(p, B, to) {
       <td><code>${esc(s.sessionId || '未登记')}</code></td>
       <td><div class="cell-stack">${sessionTiers(s).map(x => `<span class="tier-line"><span class="muted">${esc(x[0])}</span>${tierPill(x[1])}${x[2] ? `<span class="muted">${esc(x[2])}</span>` : ''}</span>`).join('')}</div></td>
       <td><div class="cell-stack">${lines.map(l => (typeof l === 'string' ? `<code>${esc(l)}</code>` : `<span class="muted">${esc(l.n)}</span>`)).join('')}${CMDS[id] ? `<button type="button" class="btn small" data-act="copy" data-c="${esc(id)}" id="b-${esc(id)}">复制命令</button>` : ''}</div></td>
-      <td><button type="button" class="btn small ghost" data-act="editSession" data-id="${pid}" data-s="${esc(s.id)}" id="es-${pid}-${esc(s.id)}">编辑</button></td></tr>`;
+      <td><div class="cell-stack"><button type="button" class="btn small ghost" data-act="editSession" data-id="${pid}" data-s="${esc(s.id)}" id="es-${pid}-${esc(s.id)}">编辑</button>${S.mode === 'file' && s.sessionId ? `<button type="button" class="btn small ghost" data-act="openTranscripts" data-id="${pid}" data-sid="${esc(s.sessionId)}" data-tool="${esc(s.tool)}">查看对话</button>` : ''}</div></td></tr>`;
   }).join('')}</tbody></table></div>` : '<p class="muted">还没有登记 Session。把还想接着用的 Session ID 记在这里，回到那台设备时一条命令就能原样打开。</p>';
   const reg = KINDS.filter(k => k.scope === 'project').map(k => `<div class="regitem"><div class="rt"><b>${esc(k.label)}</b>${tierPill(k.tier)}</div><small>${esc(k.how)}</small><div class="togs"><span class="lbl">存在于</span>${[A, Bd].map(d => `<button type="button" class="tog" id="tg-${pid}-${k.id}-${esc(d.id)}" aria-pressed="${regOn(p, k.id, d.id)}" data-act="regTog" data-id="${pid}" data-k="${k.id}" data-d="${esc(d.id)}">${esc(d.name)}</button>`).join('')}</div></div>`).join('');
   const conf = p.conflicts.length ? `<ul class="list-plain">${p.conflicts.map(c => conflictItem(p, c)).join('')}</ul>` : '<p class="muted">没有冲突记录。</p>';
@@ -822,6 +1004,7 @@ function projectDetail(p, B, to) {
       <button type="button" class="btn" data-act="editProject" data-id="${pid}" id="ep-${pid}">编辑项目</button>
       <button type="button" class="btn" data-act="addSession" data-id="${pid}" id="as-${pid}">登记 Session</button>
       <button type="button" class="btn" data-act="addConflict" data-id="${pid}" id="ac-${pid}">记录冲突</button>
+      ${S.mode === 'file' ? `<button type="button" class="btn" data-act="openTranscripts" data-id="${pid}" id="tx-${pid}">历史对话全文</button>` : ''}
       <span class="upd">${p.updatedAt ? '更新于 ' + fmtWhen(p.updatedAt) + (p.updatedOn ? '，在 ' + esc(dev(p.updatedOn).name) : '') : ''}</span>
     </div>
     <div class="notes">${note('最近一次任务', p.lastTask)}${note('下一步动作', p.nextAction)}${note('验证结果', VERIFY[p.verify.state] + (p.verify.note ? '。' + p.verify.note : '') + (p.verify.cmd ? '\n' + p.verify.cmd : ''))}${note('交接备注', p.note)}</div>
@@ -845,6 +1028,95 @@ function viewProjects() {
   return `<div class="plist"><div class="phead"><span>项目</span><span>所在设备</span><span>分支 / worktree</span><span>工具</span><span>状态</span><span>换设备后的分级</span></div>${list.map(projectRow).join('')}</div>`;
 }
 
+function viewInbox() {
+  if (S.mode !== 'file') return '<div class="panel"><div class="empty"><b>待接棒仅在文件模式下可用</b><span>请在终端运行 relay serve 打开本机网页工作台。</span></div></div>';
+  const st = S.cloud.status, paired = !!(st && st.paired);
+  const loc = st && st.cloud && (st.cloud.remote ? st.cloud.remote + ':' + (st.cloud.root || '/') : st.cloud.root || '');
+  const head = `<div class="panel"><div class="row"><div><h3 style="font-size:16px;font-weight:600">待接棒<small class="muted" style="font-weight:400;margin-left:8px">${paired ? '云端连接 ' + esc(loc || '已配对') : '尚未完成双机加密配对'}</small></h3></div><span class="grow"></span><button type="button" class="btn" data-act="cloudRefresh" id="btn-inbox-refresh" ${S.cloud.busy ? 'disabled' : ''}>${S.cloud.busy ? '正在刷新…' : '刷新待接棒'}</button></div>
+    ${!paired ? `<div class="callout"><h4>还未完成双机加密云配对</h4><p class="muted">先到「设置」里选择本机的 rclone 云盘连接与共享目录，发布公钥并核对双机配对指纹后，另一台设备加密交棒的包裹就会自动出现在这里。</p><div class="row"><button type="button" class="btn primary" data-act="goCloudSettings" id="btn-inbox-pair">前往「设置」配对设备</button></div></div>` : `<p class="muted">显示另一台设备加密上传、已通过 ready.json 完整性发布且指定本机（${esc(st.alias ? dev(st.alias).name : '当前设备')}）领取的交接包。接收前会在临时目录校验 Ed25519 签名与 SHA-256 数据流。</p>`}
+    ${S.cloud.inboxErr ? `<div class="notice">${esc(S.cloud.inboxErr)}</div>` : ''}</div>`;
+  const rec = S.cloud.lastReceived;
+  const recBanner = rec ? `<div class="banner-ok"><h4>已验签恢复交接包 · ${esc(rec.projectId || '')}</h4>
+    <p>交接编号 <code>${esc(rec.relayId || '')}</code> 已安全恢复至本机目录：<code>${esc(rec.targetPath || '')}</code>，并已向云端回写签收回执。</p>
+    ${rec.lastTask ? `<p class="muted"><b>最近任务：</b>${esc(rec.lastTask)}</p>` : ''}
+    ${rec.nextAction ? `<p class="muted"><b>下一步动作：</b>${esc(rec.nextAction)}</p>` : ''}
+    ${rec.conversations ? `<p class="muted">已归档合并历史对话共 ${Number(rec.conversations.total) || 0} 条（本次新增 ${Number(rec.conversations.added) || 0} 条，更新 ${Number(rec.conversations.updated) || 0} 条）。原本地 Session 留在原设备，可随时检索完整历史对话。</p>` : ''}
+    <div class="row">${rec.projectId ? `<button type="button" class="btn primary" data-act="openTranscripts" data-id="${esc(rec.projectId)}">查看历史对话全文</button><button type="button" class="btn" data-act="open" data-id="${esc(rec.projectId)}">打开项目详情</button>` : ''}</div></div>` : '';
+  if (!paired) return head + recBanner;
+  const items = S.cloud.incoming;
+  if (!items.length) {
+    return head + recBanner + `<div class="panel"><div class="empty"><b>当前没有待接棒的交接包</b><span>当另一台设备完成「加密上传并交棒」（或终端运行 relay send）并提示「已交棒，可以关机」后，点上方「刷新待接棒」即可领取。</span></div></div>`;
+  }
+  const cards = items.map(it => {
+    const rid = esc(it.relayId), busy = S.cloud.receiving === it.relayId;
+    const fromName = it.fromAlias ? dev(it.fromAlias).name : '来源设备';
+    const toName = it.toAlias ? dev(it.toAlias).name : '本机';
+    return `<article class="inbox-item">
+      <div class="row">
+        <b style="font-size:15.5px">${esc(it.projectName || it.projectId || '未命名项目')}</b>
+        ${it.projectId ? `<code class="muted">${esc(it.projectId)}</code>` : ''}
+        <span class="chip">${esc(fromName)} → ${esc(toName)}</span>
+        ${it.branch ? `<span class="chip">分支 <code>${esc(it.branch)}</code></span>` : '<span class="chip">非 Git 目录</span>'}
+        ${Number(it.dirty) > 0 ? `<span class="chip warn">含未提交改动 ${Number(it.dirty)}</span>` : '<span class="chip">工作区干净</span>'}
+        <span class="chip">归档会话 ${Number(it.sessionCount) || 0} 个</span>
+        ${it.pendingAck ? '<span class="chip warn">本地已恢复，待补传回执</span>' : ''}
+        ${it.tampered ? '<span class="ktag remote">签名校验异常</span>' : ''}
+        <span class="grow"></span>
+        <code class="muted">${rid}</code>
+      </div>
+      <div class="muted" style="font-size:12.5px">发布时间：${esc(it.createdAt || '未知')} · 加密包大小：${esc(fmtBytes(it.packageSize))}${it.parentRelayId ? ' · 衔接上一棒 <code>' + esc(it.parentRelayId) + '</code>' : ''}</div>
+      <div class="notes" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+        <div class="note"><h5>最近一次任务</h5><p>${it.lastTask ? esc(it.lastTask) : '<span class="faint">未填写</span>'}</p></div>
+        <div class="note"><h5>下一步动作</h5><p>${it.nextAction ? esc(it.nextAction) : '<span class="faint">未填写</span>'}</p></div>
+      </div>
+      <div class="row">
+        <button type="button" class="btn primary" data-act="receiveRelay" data-r="${rid}" id="rcv-${rid}" ${busy ? 'disabled' : ''}>${busy ? '正在下载验签并恢复…' : it.pendingAck ? '补传签收回执' : '接收交接包'}</button>
+        ${!it.pendingAck ? `<button type="button" class="btn" data-act="receiveRelayInto" data-r="${rid}" ${busy ? 'disabled' : ''}>接收至新目录…</button>` : ''}
+      </div>
+    </article>`;
+  }).join('');
+  return head + recBanner + `<div class="inbox-list">${cards}</div>`;
+}
+
+function cloudRelayCard(p) {
+  if (S.mode !== 'file' || !p) return '';
+  const pid = esc(p.id), st = S.cloud.status, paired = !!(st && st.paired);
+  const from = dev(p.device), to = other(p.device);
+  if (!paired) {
+    const miss = [];
+    if (st && !st.hasCrypto) miss.push('未检测到 PyNaCl（运行 python3 -m pip install pynacl）');
+    if (st && !st.hasRclone) miss.push('未检测到 rclone（安装 rclone 并配置网盘或对象存储连接）');
+    return `<div class="cloud-card"><div class="row"><h3 style="font-size:16px;font-weight:600">云端异步接力（加密自动上传）</h3><span class="chip">尚未配对</span><span class="grow"></span><button type="button" class="btn small" data-act="goCloudSettings" id="btn-go-cloud">前往「设置」完成配对</button></div>
+      <p class="muted">配对后无需手动复制命令：一键把 Git 分支提交、已暂存（staged）改动、未暂存（unstaged）改动、未跟踪文件与 Claude Code / Codex / Antigravity 完整可见历史对话端到端加密上传云存储，校验就绪后即可直接关机。</p>
+      ${miss.length ? `<div class="notice">${esc(miss.join('；'))}</div>` : ''}</div>`;
+  }
+  const loc = st.cloud && (st.cloud.remote ? st.cloud.remote + ':' + (st.cloud.root || '/') : st.cloud.root || '云存储');
+  const sending = S.cloud.sending === p.id;
+  const sent = S.cloud.lastSent && S.cloud.lastSent.projectId === p.id ? S.cloud.lastSent : null;
+  const cloudTransit = p.handoff && p.handoff.transport === 'cloud' ? p.handoff : null;
+  const err = S.cloud.sendError && S.cloud.sendError.projectId === p.id ? S.cloud.sendError : null;
+  const okBox = (sent || cloudTransit) ? (() => {
+    const ridTxt = (sent && sent.relayId) || (cloudTransit && (cloudTransit.relayId || cloudTransit.tag)) || '';
+    const parentTxt = (sent && sent.parentRelayId) || (cloudTransit && cloudTransit.parentRelayId) || '';
+    return `<div class="banner-ok"><h4>${esc((sent && sent.message) || '已交棒，可以关机')}</h4>
+      <p>交接编号：<code>${esc(ridTxt)}</code>${parentTxt ? `（衔接上一棒 <code>${esc(parentTxt)}</code>）` : ''} · 目标设备：<b>${esc(to.name)}</b></p>
+      <p class="muted">${sent && sent.packageSha256 ? `远端完整性复核已通过：加密包（${esc(fmtBytes(sent.packageSize))}）SHA-256 <code>${esc(sent.packageSha256)}</code> 与 Ed25519 签名清单 <code>ready.json</code> 已全部就绪，接收端解包前将逐字节校验防篡改。` : '加密包与 Ed25519 签名就绪标记均已发布至云端并通过远端校验；另一台设备随时开机进入「待接棒」或运行 relay receive 即可领取。'}</p></div>`;
+  })() : '';
+  const errBox = err ? `<div class="callout secret"><h4>未能完成加密交棒</h4><p>${esc(err.error)}</p>
+    ${err.gaps && err.gaps.length ? `<ul>${err.gaps.map(g => `<li><code>${esc(g.tool || '')}</code> · <code>${esc(g.sessionId || '')}</code>（${esc(g.reason || '')}）：${esc(g.detail || g.path || '')}</li>`).join('')}</ul>` : ''}
+    <p class="muted">补齐缺口或排除敏感凭据后再次点击即可重试；若上次上传中途中断，重试会自动沿用同一交接编号。</p></div>` : '';
+  return `<div class="cloud-card paired">
+    <div class="row"><h3 style="font-size:16px;font-weight:600">云端异步接力（加密自动上传）</h3><span class="tier native">已配对 · 端到端加密</span><code class="muted">${esc(loc)}</code><span class="grow"></span><button type="button" class="btn small" data-act="cloudRefresh">刷新云端状态</button></div>
+    <div class="route">${esc(from.name)}<span class="arrow">→</span>${esc(to.name)}</div>
+    <p class="muted">自动执行机密门禁与已登记会话缺口检查，打包 Git 提交、已暂存与未暂存改动、未跟踪文件、摘要以及三端完整可见历史对话（libsodium secretstream 加密 + Ed25519 签名）。</p>
+    ${errBox}${okBox}
+    <div class="row">
+      <button type="button" class="btn primary" data-act="cloudSend" data-id="${pid}" data-to="${esc(to.id)}" id="cs-${pid}" ${sending ? 'disabled' : ''}>${sending ? '正在打包、加密上传并校验远端…' : '加密上传并交棒'}</button>
+      <button type="button" class="btn" data-act="openTranscripts" data-id="${pid}">查看历史对话全文</button>
+    </div>
+  </div>`;
+}
+
 function viewRelay() {
   const p = S.projects.find(x => x.id === S.relayPid);
   const pick = `<div class="row"><label class="lbl" for="relaySel">项目</label><select class="inp" id="relaySel" data-chg="relaySel" style="width:auto;max-width:100%"><option value="">选择要接力的项目</option>${S.projects.map(x => `<option value="${esc(x.id)}" ${p && p.id === x.id ? 'selected' : ''}>${esc(x.name)}${x.handoff ? '（交接中）' : ''}</option>`).join('')}</select></div>`;
@@ -855,15 +1127,23 @@ function viewRelay() {
     <li>每台设备各自登录。要共用的密钥走密码管理器。误提交了密钥，先轮换，再处理历史。</li></ul></div>`;
   if (!p) {
     const moving = S.projects.filter(x => x.handoff);
-    return `<div class="panel">${pick}<p class="muted">${moving.length ? '进行中的接力：' + moving.map(x => esc(x.name)).join('、') + '。选一个继续。' : '选一个项目，生成离开前的清单、可复制的命令和到另一台设备后的恢复步骤。'}</p></div>${secrets}`;
+    return `<div class="panel">${pick}<p class="muted">${moving.length ? '进行中的接力：' + moving.map(x => esc(x.name)).join('、') + '。选一个继续。' : '选一个项目，使用云端加密自动交棒，或生成手动交接清单与命令。'}</p></div>${secrets}`;
   }
-  const pid = esc(p.id);
+  const pid = esc(p.id), cloudCard = cloudRelayCard(p);
+  if (p.handoff && p.handoff.transport === 'cloud') {
+    const h = p.handoff, F = dev(h.from), T = dev(h.to);
+    return `<div class="panel">${pick}
+      <div class="row"><div class="route">${esc(F.name)}<span class="arrow">→</span>${esc(T.name)}</div><span class="chip">${esc(TRANSPORT.cloud[0])}</span><span class="chip transit">已交棒，等待 ${esc(T.name)} 签收</span><code class="muted">${esc(h.relayId || h.tag)}</code><span class="grow"></span><button type="button" class="btn small ghost danger" data-act="cancelHandoff" data-id="${pid}" id="ch-${pid}">取消本机在途标记</button></div>
+      <p class="muted">这笔接力已通过加密云存储发出。当 ${esc(T.name)} 在「待接棒」页面或通过 <code>relay receive</code> 领取并上传签收回执后，点「刷新云端状态」即可自动核销归档。</p>
+    </div>${cloudCard}${secrets}`;
+  }
   if (!p.handoff) {
     const from = dev(p.device), to = other(p.device), cur = (S.draft[p.id] || defaultTransport(p));
     const avail = p.branch ? ['remote', 'bundle', 'patch'] : ['folder'];
     const sel = avail.includes(cur) ? cur : avail[0];
     const hist = p.history.slice(-5).reverse();
-    return `<div class="panel">${pick}
+    return `<div class="panel">${pick}</div>${cloudCard}<div class="panel">
+      <h3>手动清单接力<small>离线或不使用云接力时，按下面生成命令块逐步执行</small></h3>
       <div class="route">${esc(from.name)}<span class="arrow">→</span>${esc(to.name)}</div>
       <p class="muted">${p.branch ? '分支 <code>' + esc(p.branch) + '</code>，' + (p.dirty > 0 ? '登记了 ' + p.dirty + ' 个未提交文件' : '没有登记未提交改动') + '，' + (p.remote ? '远程 <code>' + esc(p.remote) + '</code>' : '没有远程') + '。' : '这个目录不是 Git 仓库。'}数字不对就先到项目里改。</p>
       <div><div class="lbl" style="margin-bottom:6px">怎么把代码和改动带过去</div><div class="opts">${avail.map(t => `<label class="opt"><input type="radio" name="tr-${pid}" id="tr-${pid}-${t}" value="${t}" data-chg="draftTr" data-id="${pid}" ${sel === t ? 'checked' : ''}${t === 'remote' && !p.remote ? ' disabled' : ''}><span><b>${TRANSPORT[t][0]}</b><small>${TRANSPORT[t][1]}${t === 'remote' && !p.remote ? ' 这个项目没有远程。' : ''}</small></span></label>`).join('')}</div></div>
@@ -877,10 +1157,10 @@ function viewRelay() {
   const miss = plan.miss.length ? `<div class="notice">命令里还有空位：${esc(plan.miss.join('、'))}。到「设置」填中转目录，到项目里填路径，命令就能直接复制。</div>` : '';
   const honest = `<div class="callout honest"><h4>这次接力恢复的是什么</h4><p>代码、未提交改动和摘要会到 ${esc(plan.T.name)}。原 Session 留在 ${esc(plan.F.name)}，在 ${esc(plan.T.name)} 开的是读摘要的新 Session。只有云端 Session 能在两台设备上打开同一个。</p></div>`;
   return `<div class="panel">${pick}
-      <div class="row"><div class="route">${esc(plan.F.name)}<span class="arrow">→</span>${esc(plan.T.name)}</div><span class="chip">${esc(TRANSPORT[plan.tr][0])}</span><span class="chip transit">${h.state === 'transit' ? '已离开 ' + esc(plan.F.name) : '准备中'}</span><code class="muted">${esc(h.tag)}</code><span class="grow"></span><button type="button" class="btn small ghost danger" data-act="cancelHandoff" data-id="${pid}" id="ch-${pid}">取消这次接力</button></div>
+      <div class="row"><div class="route">${esc(plan.F.name)}<span class="arrow">→</span>${esc(plan.T.name)}</div><span class="chip">${esc((TRANSPORT[plan.tr] || [plan.tr])[0])}</span><span class="chip transit">${h.state === 'transit' ? '已离开 ' + esc(plan.F.name) : '准备中'}</span><code class="muted">${esc(h.tag)}</code><span class="grow"></span><button type="button" class="btn small ghost danger" data-act="cancelHandoff" data-id="${pid}" id="ch-${pid}">取消这次接力</button></div>
       ${miss}${honest}
       ${plan.tr === 'patch' ? `<label class="field" style="max-width:420px"><span>基底提交（离开前 git rev-parse HEAD 的输出）</span><input class="inp mono" id="bc-${pid}" data-chg="baseCommit" data-id="${pid}" value="${esc(h.baseCommit || '')}" placeholder="例如 fadfd11"></label>` : ''}
-    </div>
+    </div>${cloudCard}
     <div class="panel"><h3>离开 ${esc(plan.F.name)} 之前<small>${done('pre', plan.preChecks)}</small></h3>
       <div class="steps"><div>${chk('pre', plan.preChecks)}</div><div class="cmds">${plan.pre.map(cmdBlock).join('')}</div></div>
       <div class="row"><button type="button" class="btn ${h.state === 'transit' ? '' : 'primary'}" data-act="markTransit" data-id="${pid}" id="mt-${pid}" ${h.state === 'transit' ? 'disabled' : ''}>${h.state === 'transit' ? '已标记离开' : '我已离开 ' + esc(plan.F.name)}</button></div>
@@ -930,21 +1210,59 @@ function viewConflicts() {
     <div class="panel"><h3>处理冲突的命令</h3><p class="muted">两边都改了同一处时不强推、不覆盖。先收起一边，逐个文件决定，处理完回来记一笔。</p><div class="steps"><div class="cmds">${blocks[0]}${blocks[1]}</div><div class="cmds">${blocks[2]}${blocks[3]}</div></div></div>`;
 }
 
+function cloudSettingsPanel() {
+  if (S.mode !== 'file') return '';
+  const st = S.cloud.status || {}, remotes = Array.isArray(st.remotes) ? st.remotes : [];
+  const paired = !!st.paired, peer = st.peer || null;
+  const remVal = S.cloud.form.remote, rootVal = S.cloud.form.root;
+  const cryptoChip = st.hasCrypto ? '<span class="tier native">PyNaCl 加密就绪</span>' : '<span class="chip warn">缺少 PyNaCl（pip install pynacl）</span>';
+  const rcloneChip = st.hasRclone ? '<span class="tier native">rclone 就绪</span>' : '<span class="chip warn">未检测到 rclone</span>';
+  const pairChip = paired ? '<span class="tier native">已完成双机配对</span>' : peer ? '<span class="chip warn">已发现对端公钥，待核对指纹确认</span>' : st.configured ? '<span class="chip">已发布本机公钥，等待对端</span>' : '<span class="chip">尚未配置</span>';
+  const remPick = remotes.length ? `<label class="field"><span>已发现的 rclone 连接（点选填入）</span><select class="inp" id="cloud-remote-sel" data-chg="cloudRemoteSel"><option value="">从 rclone listremotes 选择…</option>${remotes.map(r => `<option value="${esc(r)}" ${remVal === r ? 'selected' : ''}>${esc(r)}</option>`).join('')}</select></label>` : '';
+  return `<div class="panel">
+    <div class="row"><h3 style="font-size:16px;font-weight:600">云接力与设备配对<small class="muted" style="font-weight:400;margin-left:8px">端到端加密 · 两台设备连接名可不同，指向同一云端目录即可</small></h3><span class="grow"></span><button type="button" class="btn small" data-act="cloudRefresh" ${S.cloud.busy ? 'disabled' : ''}>刷新状态</button></div>
+    <div class="row">${cryptoChip}${rcloneChip}${pairChip}</div>
+    <div class="setgrid">
+      ${remPick}
+      <label class="field"><span>rclone 远端连接名（remote）</span><input class="inp mono" id="cloud-remote" value="${esc(remVal)}" placeholder="例如 onedrive、gdrive、s3relay"><small>在终端用 rclone config 配好网盘、WebDAV 或 S3 连接名。不带冒号。</small></label>
+      <label class="field"><span>云端共享目录（root）</span><input class="inp mono" id="cloud-root" value="${esc(rootVal)}" placeholder="例如 relay-desk 或 dev/relay-desk"><small>两台设备各自的连接下指向同一个共享目录路径。</small></label>
+    </div>
+    <div class="row"><button type="button" class="btn primary" data-act="cloudPairPublish" id="btn-cloud-pub" ${S.cloud.busy ? 'disabled' : ''}>${S.cloud.busy ? '正在处理…' : '保存并发布本机公钥'}</button></div>
+    <div class="setgrid">
+      <div class="fp-box">
+        <span class="lbl">本机身份与公钥指纹</span>
+        <div><b>${st.alias ? esc(dev(st.alias).name) + '（' + esc(st.alias) + '）' : '未绑定设备槽位'}</b> ${st.deviceId ? `· <code>${esc(st.deviceId)}</code>` : ''}</div>
+        <div class="fp-code">${esc(st.keyFingerprint || '点「保存并发布本机公钥」后生成')}</div>
+      </div>
+      <div class="fp-box">
+        <span class="lbl">对端设备信息</span>
+        ${peer ? `<div><b>${esc(peer.name || '对端设备')}（${esc(peer.alias || '')}）</b> · ${esc(peer.os || '')} ${peer.deviceId ? `· <code>${esc(peer.deviceId)}</code>` : ''}</div><div class="fp-code">${esc(peer.keyFingerprint || '')}</div>` : '<p class="muted">尚未在云端共享目录发现另一台设备的公钥文件。请在另一台电脑上也填写同一共享目录并点「保存并发布本机公钥」，再点「刷新状态」。</p>'}
+      </div>
+    </div>
+    <div class="fp-box">
+      <span class="lbl">共享配对指纹（请在两台设备上核对完全一致）</span>
+      <div class="fp-code">${esc(st.pairFingerprint || '等待双机公钥均发布后计算 24 位配对指纹')}</div>
+      <p class="muted" style="font-size:12.5px">确认两台电脑显示的配对指纹一字不差后点击下方按钮，将对端签名与加密公钥固定绑定在本机。</p>
+      <div class="row" style="margin-top:4px"><button type="button" class="btn primary" data-act="cloudPairAccept" id="btn-cloud-accept" ${(!st.pairFingerprint || S.cloud.busy) ? 'disabled' : ''}>${paired ? '核对指纹无误，已确认配对（重新确认）' : '核对指纹无误，确认配对'}</button></div>
+    </div>
+  </div>`;
+}
+
 function viewSettings() {
   const devs = S.config.devices.map((d, i) => `<div class="panel"><h3>${i === 0 ? '第一台设备' : '第二台设备'}</h3>
     <label class="field"><span>名称</span><input class="inp" id="cfg-name-${i}" data-chg="cfg" data-i="${i}" data-k="name" value="${esc(d.name)}"></label>
     <label class="field"><span>系统</span><select class="inp" id="cfg-os-${i}" data-chg="cfg" data-i="${i}" data-k="os"><option value="windows" ${d.os === 'windows' ? 'selected' : ''}>Windows（命令用 PowerShell）</option><option value="mac" ${d.os === 'mac' ? 'selected' : ''}>macOS（命令用 zsh）</option><option value="linux" ${d.os === 'linux' ? 'selected' : ''}>Linux（命令用 bash）</option></select></label>
-    <label class="field"><span>中转目录</span><input class="inp mono" id="cfg-drop-${i}" data-chg="cfg" data-i="${i}" data-k="drop" value="${esc(d.drop)}" placeholder="${d.os === 'windows' ? 'D:\\handoff' : '~/handoff 请写成完整路径'}"><small>两台设备都能读写的地方：网盘文件夹、共享盘或 U 盘。bundle、补丁和额外同步的文件放这里。凭据不放这里。</small></label></div>`).join('');
+    <label class="field"><span>中转目录</span><input class="inp mono" id="cfg-drop-${i}" data-chg="cfg" data-i="${i}" data-k="drop" value="${esc(d.drop)}" placeholder="${d.os === 'windows' ? 'D:\\handoff' : '~/handoff 请写成完整路径'}"><small>手动接力时两台设备都能读写的地方：网盘文件夹、共享盘或 U 盘。bundle、补丁和额外同步的文件放这里。凭据不放这里。</small></label></div>`).join('');
   const store = S.mode === 'file'
-    ? '数据就是这台电脑上的 ledger.json 文件，Claude Code、Codex、Antigravity 和这个页面共用它。页面每几秒会重新读一次，另一边改了这里也会跟着更新。要换设备，把 ledger.json 放进同步的文件夹或用下面的备份搬运。'
+    ? '数据就是这台电脑上的 ledger.json 文件，Claude Code、Codex、Antigravity 和这个页面共用它。页面每几秒会重新读一次，另一边改了这里也会跟着更新。配好上方云接力后，两台电脑无需共用网盘文件即可端到端加密交棒。'
     : S.mode === 'db'
     ? '数据保存在这个页面自己的云端数据库里。两台设备登录同一个 claude.ai 账户打开这个页面，看到的是同一份。'
     : '现在是本地模式，数据只在这个浏览器里。用下面的备份在两台设备之间搬运。';
-  return `<div class="setgrid">${devs}</div>
+  return `${cloudSettingsPanel()}<div class="setgrid">${devs}</div>
     <div class="panel"><h3>每天怎么用</h3><ul class="list-plain">
-      <li><b>离开前</b>　对 Claude Code、Codex 或 Antigravity 说「接力」。它会写 HANDOFF.md、更新台账、打印清单和命令；写入远程的命令留给你自己执行。</li>
-      <li><b>到另一台</b>　打开这个页面，同一个项目显示「交接中」。对代理说「接棒」，照「到达之后」做。</li>
-      <li><b>回到原设备</b>　先反向接力一次，再用登记的 Session ID 原样恢复：<code>claude --resume &lt;id&gt;</code>、<code>codex resume &lt;id&gt;</code> 或 <code>agy --conversation &lt;id&gt;</code>。</li></ul></div>
+      <li><b>离开前</b>　对 Claude Code、Codex 或 Antigravity 说「接力」。已配对云接力时会自动加密打包并显示「已交棒，可以关机」；未配对时生成手动清单与命令。</li>
+      <li><b>到另一台</b>　对代理说「接棒」，或在「待接棒」标签页一键验签接收交接包并查阅三端历史对话全文。</li>
+      <li><b>回到原设备</b>　先反向接力一次让代码和归档对话同步回来，再用登记的 Session ID 原样恢复：<code>claude --resume &lt;id&gt;</code>、<code>codex resume &lt;id&gt;</code> 或 <code>agy --conversation &lt;id&gt;</code>。</li></ul></div>
     <div class="panel"><h3>数据存在哪里</h3><p class="muted">${store}</p>
       <div class="row"><button type="button" class="btn" data-act="exportJson" id="btn-export">生成备份</button><button type="button" class="btn" data-act="copyExport" id="btn-copyexp">复制备份</button></div>
       <textarea class="inp mono" id="io" rows="6" placeholder="备份内容会出现在这里。要导入时把另一份备份粘贴进来。" aria-label="备份内容">${esc(S.io || '')}</textarea>
@@ -954,13 +1272,14 @@ function viewSettings() {
 function renderView() {
   S.cmdSeq = 0; Object.keys(CMDS).forEach(k => delete CMDS[k]);
   const v = S.view;
-  $('#view').innerHTML = `<div style="display:flex;flex-direction:column;gap:16px">${v === 'projects' ? viewProjects() : v === 'relay' ? viewRelay() : v === 'registry' ? viewRegistry() : v === 'conflicts' ? viewConflicts() : viewSettings()}</div>`;
+  $('#view').innerHTML = `<div style="display:flex;flex-direction:column;gap:16px">${v === 'projects' ? viewProjects() : v === 'inbox' ? viewInbox() : v === 'relay' ? viewRelay() : v === 'registry' ? viewRegistry() : v === 'conflicts' ? viewConflicts() : viewSettings()}</div>`;
 }
 function renderAll() {
   const view = $('#view'), ae = document.activeElement;
   if (ae && view.contains(ae) && /^(INPUT|TEXTAREA)$/.test(ae.tagName) && !/checkbox|radio/.test(ae.type)) { S.pending = true; renderChrome(); renderTrack(); return; }
   S.pending = false;
-  const fid = ae && ae.id && !$('#dlg').open ? ae.id : null;
+  const txDlg = $('#txDlg');
+  const fid = ae && ae.id && !$('#dlg').open && !(txDlg && txDlg.open) ? ae.id : null;
   renderChrome(); renderTrack(); renderView();
   if (fid && document.activeElement !== ae) { const el = document.getElementById(fid); if (el) el.focus({ preventScroll: true }); }
 }
@@ -1013,7 +1332,7 @@ function projectFields() {
     { key: 'branch', label: '分支', mono: true, hint: '留空表示这个目录不是 Git 仓库。' },
     { key: 'worktree', label: 'Worktree', mono: true, hint: '正在用的 worktree 目录。没有就留空。' },
     { key: 'remote', label: '远程', mono: true, hint: '例如 origin。留空表示没有远程。' },
-    { key: 'transport', label: '默认带走方式', type: 'select', options: [['', '按情况自动选']].concat(Object.entries(TRANSPORT).map(([k, v]) => [k, v[0]])) },
+    { key: 'transport', label: '默认带走方式', type: 'select', options: [['', '按情况自动选']].concat(Object.entries(TRANSPORT).filter(([k]) => k !== 'cloud').map(([k, v]) => [k, v[0]])) },
     { key: 'dirty', label: '未提交改动（文件数）', type: 'number', hint: 'git status --short 的行数。' },
     { key: 'unpushed', label: '未推送的提交数', type: 'number', nullable: true, hint: '不确定就留空。' },
     { key: 'lastTask', label: '最近一次任务', type: 'textarea', span: 2 },
@@ -1086,9 +1405,126 @@ function copyText(text, btn) {
   try { navigator.clipboard.writeText(text).then(ok, fallback); } catch (e) { fallback(); }
 }
 
+/* ---------- 云接力接收弹窗与历史对话全文查阅 ---------- */
+function openReceiveModal(item, mode, errData) {
+  const dlg = $('#dlg');
+  const hereId = (S.cloud.status && S.cloud.status.alias) || S.here;
+  const proj = item && item.projectId ? S.projects.find(x => x.id === item.projectId) : null;
+  const knownPath = (errData && errData.targetPath) || (proj && hereId && proj.paths && proj.paths[hereId]) || '';
+  const pName = (item && item.projectName) || (errData && errData.projectName) || (item && item.projectId) || item.relayId;
+  const isDirty = mode === 'target_dirty';
+  const suggestInto = isDirty && knownPath ? knownPath + '-' + String(item.relayId || 'relay').slice(-6) : '';
+  const reasons = errData && Array.isArray(errData.reasons) && errData.reasons.length ? `<ul>${errData.reasons.map(r => `<li>${esc(r)}</li>`).join('')}</ul>` : '';
+  dlg.innerHTML = `<form class="form" id="rcvForm" novalidate>
+    <header><h3>${esc(isDirty ? '保护原目录 · 接收至新目录' : '接收交接包 · ' + pName)}</h3><button type="button" class="btn small ghost" data-x id="rcv-x">关闭</button></header>
+    <div class="form-body">
+      ${isDirty
+        ? `<div class="callout secret"><h4>检测到本机原目录含有未同步的本地改动，原目录已完整保留！</h4>
+            <p>${esc((errData && errData.error) || '本机目标目录存在未提交改动或本地新提交，系统已拒绝覆盖原目录，原目录文件与 Git 状态完好无损。')}</p>
+            ${reasons}
+            <p class="muted">你可以先去原目录整理改动后再接收，或在下方指定一个全新的本地目录（into），把这次交接包安全恢复到新目录：</p></div>
+          <label class="field"><span>接收至新目录（保留原目录不动）</span><input class="inp mono" id="rcv-into" name="into" value="${esc(suggestInto)}" placeholder="例如 /Users/you/Developer/${esc(item.projectId || 'project')}-incoming" required autocomplete="off"><small>请填写一个不存在或为空的新目录完整路径。</small></label>`
+        : `<p class="muted">${esc((errData && errData.error) || '首次在这台设备上接收该项目，请指定要把代码与工作区状态恢复到的本机目录：')}</p>
+          <label class="field"><span>本机项目目录（path）</span><input class="inp mono" id="rcv-path" name="path" value="${esc(knownPath)}" placeholder="例如 /Users/you/Developer/${esc(item.projectId || 'project')}" required autocomplete="off"><small>解包前会先在临时目录完成签名与完整性校验。</small></label>`}
+    </div>
+    <footer><span class="grow"></span><button type="button" class="btn ghost" data-x>取消</button><button type="submit" class="btn primary">${isDirty ? '保留原目录，接收至新目录' : '确认接收并解包'}</button></footer>
+  </form>`;
+  const form = $('#rcvForm', dlg);
+  form.addEventListener('submit', e => {
+    e.preventDefault();
+    if (isDirty) {
+      const v = form.elements.into.value.trim();
+      if (!v) { form.elements.into.focus(); toast('请填写新的目标目录路径。'); return; }
+      Cloud.receive(item.relayId, { into: v });
+    } else {
+      const v = form.elements.path.value.trim();
+      if (!v) { form.elements.path.focus(); toast('请填写本机项目目录路径。'); return; }
+      Cloud.receive(item.relayId, { path: v });
+    }
+  });
+  dlg.onclick = e => { if (e.target.closest('[data-x]')) dlg.close(); };
+  if (typeof dlg.showModal === 'function') dlg.showModal(); else dlg.setAttribute('open', '');
+}
+
+async function fetchTranscripts(opts) {
+  if (S.mode !== 'file' || !S.tx.projectId) return;
+  opts = opts || {};
+  S.tx.loading = true; S.tx.err = '';
+  renderTranscriptsModal();
+  const qs = ['project=' + encodeURIComponent(S.tx.projectId)];
+  if (S.tx.tool) qs.push('tool=' + encodeURIComponent(S.tx.tool));
+  if (S.tx.session) qs.push('session=' + encodeURIComponent(S.tx.session));
+  if (S.tx.q) qs.push('q=' + encodeURIComponent(S.tx.q));
+  try {
+    const r = await Store.apiReq('GET', '/api/cloud/transcripts?' + qs.join('&'), undefined, 20000);
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { S.tx.err = d.error || ('读取归档对话失败（HTTP ' + r.status + '）'); S.tx.loading = false; renderTranscriptsModal(); return; }
+    S.tx.data = d;
+    if (opts.autoPick && !S.tx.session && !S.tx.q && Array.isArray(d.sessions) && d.sessions.length > 0) {
+      S.tx.session = d.sessions[0].sessionId || '';
+      await fetchTranscripts({ autoPick: false });
+      return;
+    }
+  } catch (e) {
+    S.tx.err = '读取归档历史对话失败，请检查本机 relay serve 服务。';
+  }
+  S.tx.loading = false;
+  renderTranscriptsModal();
+}
+
+function renderTranscriptsModal() {
+  const dlg = $('#txDlg'); if (!dlg) return;
+  const p = S.projects.find(x => x.id === S.tx.projectId);
+  const pName = (p && p.name) || S.tx.projectId;
+  const d = S.tx.data || {}, sessions = Array.isArray(d.sessions) ? d.sessions : [], matches = Array.isArray(d.matches) ? d.matches : [];
+  CMDS.txMarkdown = d.markdown || '';
+  const side = sessions.length ? sessions.map(s => {
+    const cur = S.tx.session && S.tx.session === s.sessionId;
+    return `<button type="button" class="tx-sbtn" aria-current="${cur ? 'true' : 'false'}" data-act="txPick" data-sid="${esc(s.sessionId || '')}" data-tool="${esc(s.tool || '')}">
+      <div class="row" style="gap:5px"><span class="chip">${esc(TOOL_LABEL[s.tool] || s.tool || '')}</span><small class="muted">${esc(s.lastUsed || '')}</small></div>
+      <b style="font-weight:500;overflow-wrap:anywhere">${esc(s.title || s.sessionId || '未命名会话')}</b>
+      <small class="muted"><code>${esc((s.sessionId || '').slice(0, 18))}</code> · ${Number(s.turnCount) || 0} 回合${s.originDevice ? ' · 来自 ' + esc(dev(s.originDevice).name) : ''}</small>
+    </button>`;
+  }).join('') : '<div class="empty" style="padding:20px 12px"><span>暂无归档会话记录</span></div>';
+  let mainHtml = '';
+  if (S.tx.loading) mainHtml = '<p class="muted">正在加载历史对话归档…</p>';
+  else if (S.tx.err) mainHtml = `<div class="notice">${esc(S.tx.err)}</div>`;
+  else {
+    const hitBlock = S.tx.q ? `<div style="display:flex;flex-direction:column;gap:8px"><div class="lbl">关键词「${esc(S.tx.q)}」匹配结果（${matches.length} 条）</div>${matches.length ? matches.map(m => `<div class="tx-hit"><div class="row"><span class="chip">${esc(TOOL_LABEL[m.tool] || m.tool || '')}</span><b>${esc(m.title || m.sessionId || '')}</b>${m.role ? `<span class="muted">${esc(m.role)}</span>` : ''}<span class="grow"></span>${m.sessionId ? `<button type="button" class="btn small" data-act="txPick" data-sid="${esc(m.sessionId)}" data-tool="${esc(m.tool || '')}">查看完整对话</button>` : ''}</div><pre class="tx-md">${esc(m.snippet || m.content || m.text || '')}</pre></div>`).join('') : '<p class="muted">没有找到包含该关键词的历史对话片段。</p>'}</div>` : '';
+    const mdBlock = d.markdown ? `<div><div class="row" style="margin-bottom:6px"><span class="lbl">完整对话全文</span><span class="grow"></span><button type="button" class="btn small" data-act="copy" data-c="txMarkdown">复制全文</button></div><pre class="tx-md" id="txMarkdown">${esc(d.markdown)}</pre></div>` : (!S.tx.q ? `<p class="muted">${sessions.length ? '点击左侧任意一条会话即可阅读完整可见对话。' : '该项目还没有归档的历史对话。经过一次云端接力后，Claude Code、Codex 和 Antigravity 的可见对话会自动去重归档到这里。'}</p>` : '');
+    mainHtml = hitBlock + mdBlock;
+  }
+  dlg.innerHTML = `<div class="form">
+    <header><h3>历史对话全文 · ${esc(pName)}</h3><button type="button" class="btn small ghost" data-act="txClose">关闭</button></header>
+    <div class="form-body">
+      <div class="row">
+        <select class="inp" id="tx-tool" data-chg="txTool" style="width:auto"><option value="">全部工具</option><option value="claude" ${S.tx.tool === 'claude' ? 'selected' : ''}>Claude Code</option><option value="codex" ${S.tx.tool === 'codex' ? 'selected' : ''}>Codex</option><option value="anti" ${S.tx.tool === 'anti' ? 'selected' : ''}>Antigravity</option></select>
+        <input class="inp" type="search" id="tx-q" value="${esc(S.tx.q)}" placeholder="输入关键词跨会话全文检索…" style="flex:1 1 220px" aria-label="检索历史对话">
+        <button type="button" class="btn primary" data-act="txSearch">搜索</button>
+        ${(S.tx.q || S.tx.tool) ? '<button type="button" class="btn ghost" data-act="txReset">重置</button>' : ''}
+      </div>
+      <div class="tx-layout"><div class="tx-side">${side}</div><div class="tx-main">${mainHtml}</div></div>
+      <p class="foot">归档文件存于本机 <code>${esc(d.archiveDir || '~/.relay-desk/archives/' + S.tx.projectId)}</code>（按工具、Session ID 与内容版本自动去重）。仅供跨设备查阅上下文，不等于在当前设备恢复原本地 Session。</p>
+    </div>
+  </div>`;
+}
+
+function openTranscriptsModal(projectId, sid, tool) {
+  if (S.mode !== 'file' || !projectId) return;
+  S.tx = { projectId, session: sid || '', tool: tool || '', q: '', loading: true, data: null, err: '' };
+  const dlg = $('#txDlg');
+  renderTranscriptsModal();
+  if (typeof dlg.showModal === 'function') { if (!dlg.open) dlg.showModal(); } else dlg.setAttribute('open', '');
+  fetchTranscripts({ autoPick: !sid });
+}
+
 /* ---------- 交互 ---------- */
 const ACT = {
-  tab: el => { S.view = el.dataset.v; renderAll(); },
+  tab: el => {
+    S.view = el.dataset.v;
+    renderAll();
+    if (S.mode === 'file' && (S.view === 'inbox' || S.view === 'settings' || S.view === 'relay')) Cloud.refresh({ inbox: true });
+  },
   toggle: el => { S.open = S.open === el.dataset.id ? null : el.dataset.id; renderAll(); },
   open: el => { S.view = 'projects'; S.open = el.dataset.id; S.filters = { q: '', device: '', tool: '', status: '', dirty: '' }; ['f-q', 'f-tool', 'f-status', 'f-dirty'].forEach(i => { $('#' + i).value = ''; }); renderAll(); const r = document.getElementById('row-' + el.dataset.id); if (r) r.scrollIntoView({ block: 'nearest' }); },
   clearFilters: () => { S.filters = { q: '', device: '', tool: '', status: '', dirty: '' }; ['f-q', 'f-tool', 'f-status', 'f-dirty'].forEach(i => { $('#' + i).value = ''; }); renderAll(); },
@@ -1105,7 +1541,31 @@ const ACT = {
   editConflict: el => editConflict(el.dataset.id, el.dataset.c),
   regTog: el => mutate(el.dataset.id, c => { const r = c.reg[el.dataset.k] || (c.reg[el.dataset.k] = { on: {} }); r.on = r.on || {}; r.on[el.dataset.d] = !r.on[el.dataset.d]; }),
   gregTog: el => { const g = S.config.reg; const r = g[el.dataset.k] || (g[el.dataset.k] = { on: {} }); r.on = r.on || {}; r.on[el.dataset.d] = !r.on[el.dataset.d]; Store.saveConfig(); },
-  relay: el => { S.view = 'relay'; S.relayPid = el.dataset.id; renderAll(); window.scrollTo({ top: $('#tabs').offsetTop - 8 }); },
+  relay: el => { S.view = 'relay'; S.relayPid = el.dataset.id; renderAll(); if (S.mode === 'file') Cloud.refresh({ inbox: true }); window.scrollTo({ top: $('#tabs').offsetTop - 8 }); },
+  goCloudSettings: () => { S.view = 'settings'; renderAll(); if (S.mode === 'file') Cloud.refresh({ inbox: true }); window.scrollTo({ top: $('#tabs').offsetTop - 8 }); },
+  cloudRefresh: () => Cloud.refresh({ inbox: true, manual: true }),
+  cloudPairPublish: () => Cloud.pair(false),
+  cloudPairAccept: () => Cloud.pair(true),
+  cloudSend: el => Cloud.send(el.dataset.id, el.dataset.to),
+  receiveRelay: el => {
+    const relayId = el.dataset.r;
+    const item = S.cloud.incoming.find(x => x.relayId === relayId) || { relayId };
+    const hereId = (S.cloud.status && S.cloud.status.alias) || S.here;
+    const proj = item.projectId ? S.projects.find(x => x.id === item.projectId) : null;
+    const knownPath = proj && hereId && proj.paths && proj.paths[hereId];
+    if (!item.pendingAck && !knownPath) { openReceiveModal(item, 'need_path', null); return; }
+    Cloud.receive(relayId, {});
+  },
+  receiveRelayInto: el => {
+    const relayId = el.dataset.r;
+    const item = S.cloud.incoming.find(x => x.relayId === relayId) || { relayId };
+    openReceiveModal(item, 'target_dirty', { error: '你将把这次交接包恢复到一个新的本地目录，原目录保持不变。' });
+  },
+  openTranscripts: el => openTranscriptsModal(el.dataset.id, el.dataset.sid || '', el.dataset.tool || ''),
+  txClose: () => { const d = $('#txDlg'); if (d) d.close(); },
+  txPick: el => { S.tx.session = el.dataset.sid || ''; if (el.dataset.tool && !S.tx.tool) {} fetchTranscripts({ autoPick: false }); },
+  txSearch: () => { const qEl = $('#tx-q'); S.tx.q = qEl ? qEl.value.trim() : ''; S.tx.session = ''; fetchTranscripts({ autoPick: false }); },
+  txReset: () => { S.tx.q = ''; S.tx.tool = ''; S.tx.session = ''; fetchTranscripts({ autoPick: true }); },
   startHandoff: el => mutate(el.dataset.id, c => {
     const from = dev(c.device), to = other(c.device), avail = c.branch ? ['remote', 'bundle', 'patch'] : ['folder'];
     let tr = S.draft[c.id] || defaultTransport(c); if (!avail.includes(tr) || (tr === 'remote' && !c.remote)) tr = c.branch ? 'bundle' : 'folder';
@@ -1132,11 +1592,22 @@ const CHG = {
   chk: el => mutate(el.dataset.id, c => { if (!c.handoff) return; const ph = el.dataset.ph; c.handoff[ph] = c.handoff[ph] || {}; c.handoff[ph][el.dataset.k] = el.checked; }),
   baseCommit: el => mutate(el.dataset.id, c => { if (c.handoff) c.handoff.baseCommit = el.value.trim(); }),
   gregNote: el => { const g = S.config.reg; const r = g[el.dataset.k] || (g[el.dataset.k] = { on: {} }); r.note = el.value.trim(); Store.saveConfig(); },
-  cfg: el => { const d = S.config.devices[+el.dataset.i]; if (!d) return; const v = el.value.trim(); if (el.dataset.k === 'name' && !v) { el.value = d.name; return; } d[el.dataset.k] = v; Store.saveConfig(); }
+  cfg: el => { const d = S.config.devices[+el.dataset.i]; if (!d) return; const v = el.value.trim(); if (el.dataset.k === 'name' && !v) { el.value = d.name; return; } d[el.dataset.k] = v; Store.saveConfig(); },
+  cloudRemoteSel: el => { if (el.value) { S.cloud.form.remote = el.value; S.cloud.form.touched = true; const inp = $('#cloud-remote'); if (inp) inp.value = el.value; } },
+  txTool: el => { S.tx.tool = el.value; S.tx.session = ''; fetchTranscripts({ autoPick: !S.tx.q }); }
 };
 document.addEventListener('click', e => { const el = e.target.closest('[data-act]'); if (el && ACT[el.dataset.act] && !el.disabled) ACT[el.dataset.act](el, e); });
 document.addEventListener('change', e => { const el = e.target.closest('[data-chg]'); if (el && CHG[el.dataset.chg]) CHG[el.dataset.chg](el, e); });
-document.addEventListener('input', e => { if (e.target.id === 'f-q') { S.filters.q = e.target.value; renderView(); } else if (e.target.id === 'io') S.io = e.target.value; });
+document.addEventListener('input', e => {
+  if (e.target.id === 'f-q') { S.filters.q = e.target.value; renderView(); }
+  else if (e.target.id === 'io') S.io = e.target.value;
+  else if (e.target.id === 'cloud-remote') { S.cloud.form.remote = e.target.value; S.cloud.form.touched = true; }
+  else if (e.target.id === 'cloud-root') { S.cloud.form.root = e.target.value; S.cloud.form.touched = true; }
+  else if (e.target.id === 'tx-q') S.tx.q = e.target.value;
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && e.target && e.target.id === 'tx-q') { e.preventDefault(); ACT.txSearch(); }
+});
 document.addEventListener('focusout', () => setTimeout(() => { if (S.pending) renderAll(); }, 0));
 
 pickHere(); renderAll(); Store.init();

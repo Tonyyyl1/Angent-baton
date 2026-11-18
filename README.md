@@ -2,167 +2,218 @@
 
 **English** | [简体中文](./README.zh-CN.md)
 
-**relay-desk** is a local-first, zero-dependency handoff ledger for moving coding projects smoothly between **Windows** and **macOS** across **Claude Code**, **Codex**, **Antigravity**, and a **local web dashboard**.
+**relay-desk** is a local-first two-machine development relay and handoff ledger for moving coding projects seamlessly between any two desktop machines (**Windows**, **macOS**, or **Linux** — including Win ↔ Mac, Mac ↔ Mac, Win ↔ Win, and Linux ↔ Mac) across **Claude Code**, **Codex**, **Antigravity**, and a **local web workbench**.
 
-All four surfaces read and write the exact same `ledger.json` file on disk—tracking which machine currently holds your latest working state, uncommitted changes, branch, verification status, next action, and local agent session IDs.
+All four surfaces share the same local `ledger.json` and cross-agent conversation archive—supporting both **end-to-end encrypted cloud async relay** (hand off on Machine A and shut down immediately; power on Machine B anytime to verify, unpack, and continue) and **zero-dependency manual checklist relay** (100% offline).
 
 ```
-Claude Code ──┐
-Codex ────────┼── relay CLI ──► ledger.json ◄── relay serve ◄── Web UI
-Antigravity ──┘
+Claude Code ──┐                                                 ┌── Encrypted Cloud Async Relay (rclone / S3 / WebDAV / Drive)
+Codex ────────┼── relay CLI ──► ledger.json + Archive ◄─────────┤
+Antigravity ──┤                       ▲                         └── Manual Checklist Relay (remote / bundle / patch / folder)
+Web Workbench ┴──── relay serve ──────┘
 ```
 
 ---
 
 ## Why relay-desk?
 
-Switching between a Windows desktop and a MacBook mid-feature usually breaks down in predictable ways: dirty working trees, unpushed branches on team repos where force-pushing is off-limits, forgotten local rules/skills, or confusion over what transfers via Git versus what stays locked inside a local agent database.
+Switching between two computers mid-feature breaks down in predictable ways: half-finished staged and unstaged edits, team repos where pushing personal WIP branches is undesirable, machine-local skills/rules, or losing detailed conversation context discussed on the previous machine.
 
-**relay-desk** classifies every piece of project and machine state into four explicit tiers:
+**relay-desk** classifies project and machine state into four explicit tiers—and carries everything portable in one authenticated, encrypted relay package:
 
 | Tier | Meaning | Examples |
 |---|---|---|
 | **Native** | Opens the exact same live session on both machines | Cloud sessions, Claude Remote Control |
-| **Git** | Travels with commits once pushed or bundled | Committed code, `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.claude/skills/`, `.codex/`, `.agents/`, `HANDOFF.md` |
-| **Extra** | Lives outside Git or is uncommitted; carried via WIP branch, `git bundle`, patch, or drop folder | Dirty files, `CLAUDE.local.md`, Claude memory, global skills (`~/.claude/skills/`, `~/.codex/skills/`, `~/.gemini/config/skills/`), optional transcript / `brain/` artifacts |
-| **Manual** | Never synced; configured or resumed per machine | OAuth logins (`~/.claude.json`, `~/.codex/auth.json`, `~/.gemini/oauth_creds.json`), `.env` secrets, local SQLite state, running dev servers |
+| **Git** | Travels with commits or `git bundle` | Committed code, `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.claude/skills/`, `.codex/`, `.agents/`, `HANDOFF.md` |
+| **Extra** | Uncommitted or outside Git; bundled automatically in Cloud Relay or carried via WIP branch / `bundle` / patch / drop folder in Manual mode | **Staged** changes, **unstaged** changes, untracked files, deduplicated full visible conversation archives across all 3 agents, global skills & rules |
+| **Manual** | Never synced; configured or resumed per machine | OAuth logins (`~/.claude.json`, `~/.codex/auth.json`, `~/.gemini/oauth_creds.json`), `.env` secrets, private keys, local SQLite session databases, running processes |
 
 ---
 
-## Features
+## Key Features
 
-- **Shared Single-File Ledger**: Atomic, lock-protected JSON storage (`ledger.json`) shared live by the CLI and the `127.0.0.1` web UI (`relay serve`).
-- **Three Coding Agents Built In**: Native session discovery, resume commands, state scanning, and agent skills for **Claude Code** (`claude`), **Codex** (`codex`), and **Antigravity** (`anti` / `agy`).
-- **Four Transport Modes**:
-  - `remote`: Commits dirty work to a personal `wip/handoff-<tag>` branch and prints the push/fetch/apply sequence without touching `main`.
-  - `bundle`: Packs commits and uncommitted changes into a single `.bundle` file in your synced drop folder—ideal for repos without a remote or shared team repos where you do not want personal WIP branches.
-  - `patch`: Exports binary-safe `git diff HEAD` patches when both machines are on the same base commit.
-  - `folder`: Copies non-Git directories via `robocopy` (Windows) / `rsync` (macOS/Linux), excluding `.env` by default.
-- **Cross-Shell Command Generation**: Emits ready-to-run **PowerShell** commands for Windows and **zsh / bash** commands for macOS/Linux, each tagged with execution safety (`read`, `local`, or `remote`).
-- **Zero Dependencies**: Python 3.9+ standard library only. No `pip install`, no build step, no telemetry, no network calls.
+- **End-to-End Encrypted Cloud Async Relay (Time-Shifted Handoff)**:
+  - Encrypts locally using `PyNaCl` (libsodium `crypto_secretstream_xchacha20poly1305` chunked streaming encryption + X25519 key wrapping + Ed25519 detached signatures). Cloud storage only ever sees ciphertext.
+  - **Exact Workspace Restoration**: Carries Git commits/branches, **staged index (`git diff --cached`)**, **unstaged working tree (`git diff`)**, and **untracked files** (or non-Git folder snapshots). Enforces a **pre-pack secret gate** that excludes `.env`/credential files without reading them and aborts before upload if any tracked file or Git commit contains private keys or credential files.
+  - **Two-Phase Atomic Publish & Shutdown Confirmation**: Uploads `package.enc` and verifies remote size first, then uploads signed `ready.json` and verifies remote presence before printing **`已交棒，可以关机`** (*"Handoff complete, safe to shut down"*). Interrupted uploads reuse the same `relayId` on retry; incomplete uploads without `ready.json` are never shown as claimable.
+  - **Safe Temp Verification & Dirty-Target Protection**: Receivers verify Ed25519 signatures, SHA-256 digests, and `secretstream` integrity inside an isolated temporary directory before touching any workspace. If the local target directory has unsynced edits or commits, the original directory is preserved untouched and `--into <new_dir>` lets you receive cleanly into a new path.
+- **Full Cross-Agent Conversation Archiving & Search**:
+  - Detects missing or truncated/unflushed session logs before sending (reporting exact gaps so you can fix and retry), archives all visible conversations from **Claude Code**, **Codex**, and **Antigravity**, and deduplicates by `(tool, sessionId, contentVersion)` across `A → B → A` round-trips with zero duplicates. Browse and search anytime via `relay transcripts` or the Web UI viewer.
+- **Swappable Cloud Storage (`StorageProvider`)**:
+  - Ships with an `rclone` adapter supporting OneDrive, Google Drive, Dropbox, WebDAV, and S3-compatible object storage out of the box—Device A and Device B can even use different `rclone` remote names pointing to the same shared cloud folder. Implement `StorageProvider` to plug in any custom backend (see [`docs/STORAGE_PROVIDER.md`](./docs/STORAGE_PROVIDER.md)).
+- **Zero-Dependency Manual Fallback**:
+  - Ledger management, Git/session scanning, the loopback Web UI (`relay serve`), and manual cross-shell (`PowerShell` / `zsh` / `bash`) handoff checklists work on pure Python 3.9+ standard library with zero `pip` packages.
+
+---
+
+## Requirements & Setup
+
+- **Core (Required)**: **Python 3.9+** and **Git**.
+- **Encrypted Cloud Async Relay (Optional, Recommended)**:
+  1. Install `PyNaCl` (libsodium bindings):
+     ```bash
+     # macOS / Linux
+     python3 -m pip install --user pynacl
+     # Windows
+     py -3 -m pip install --user pynacl
+     ```
+  2. Install and configure [`rclone`](https://rclone.org/) for your preferred cloud drive, WebDAV, or S3 bucket:
+     ```bash
+     # macOS
+     brew install rclone
+     # Windows
+     winget install Rclone.Rclone
+     # Authorize your cloud remote:
+     rclone config
+     ```
 
 ---
 
 ## Quick Start
 
-Requires **Python 3.9+** and **Git**. Run the commands below inside the `relay-desk` folder (`relay` stands for `py -3 relay.py` or `relay.cmd` on Windows, and `python3 relay.py` or `./relay` on macOS/Linux).
+Run the commands below inside the `relay-desk` directory (`relay` stands for `py -3 relay.py` or `relay.cmd` on Windows, and `python3 relay.py` or `./relay` on macOS/Linux).
 
-### 1. Windows Setup (Device A)
+### 1. Initialize Both Machines & Install Agent Skills
 
-```powershell
-py -3 relay.py init --device a --host
-py -3 relay.py device --which a --drop D:\handoff
-py -3 relay.py install-skills
-py -3 relay.py serve
+On **Device A**:
+
+```bash
+relay init --device a --host
+relay install-skills
 ```
 
-### 2. macOS Setup (Device B)
+On **Device B** (run `chmod +x relay` once on macOS/Linux):
 
-Run `chmod +x relay` once, then:
-
-```zsh
-python3 relay.py init --device b --host
-python3 relay.py device --which b --drop "/Users/<you>/Handoff"
-python3 relay.py install-skills
-python3 relay.py serve
+```bash
+relay init --device b --host
+relay install-skills
 ```
 
-- **Sharing the ledger across both machines**: Point both machines at a `ledger.json` inside a synced folder (iCloud Drive, OneDrive, Dropbox, Syncthing, etc.):
-  ```bash
-  relay init --device a --ledger "<path-to-synced-folder>/ledger.json" --host
-  ```
-  Each machine stores its own pointer and device ID locally in `~/.relay-desk/config.json` (which is never synced).
-- **Installing agent skills**: `install-skills` installs the `relay-desk` skill for all three agents by default, or individually via `--claude`, `--codex`, and `--anti`:
+- `install-skills` installs the `relay-desk` skill for all three agents by default (or individually via `--claude`, `--codex`, `--anti`):
   - Claude Code → `~/.claude/skills/relay-desk`
   - Codex → `~/.codex/skills/relay-desk` (or `$CODEX_HOME/skills/relay-desk`)
   - Antigravity → `~/.gemini/config/skills/relay-desk` (or `$GEMINI_CONFIG_DIR/skills/relay-desk`)
-- **Web dashboard**: `relay serve` starts a loopback-only server at `http://127.0.0.1:8765/` and opens your browser (pass `--no-open` to skip opening the browser).
+
+### 2. Pair Cloud Async Relay (Recommended)
+
+Device A and Device B can use different `rclone` remote names as long as they point to the same shared cloud folder:
+
+```bash
+# 1. List configured rclone remotes on this machine
+relay cloud remotes
+
+# 2. Publish Device A's signed public descriptor
+relay pair --remote <remote_on_a> --root relay-desk
+
+# 3. Publish Device B's signed public descriptor to the same shared folder
+relay pair --remote <remote_on_b> --root relay-desk
+
+# 4. Verify the 24-character pairing fingerprint matches on BOTH screens, then accept on each:
+relay pair --accept
+relay pair --status
+```
+
+*(You can also complete pairing visually in `relay serve` under **Settings → 云接力与设备配对**.)*
 
 ---
 
 ## Daily Workflow
 
-### Registering a Project
+### Register a Project
 
 ```bash
 relay add my-app --path /path/to/my-app --tool all
-# On the other machine (or with --path-other):
-relay set my-app --path-other "D:\workspace\my-app"
 ```
 
-### Leaving This Machine: Say *"handoff"* (or「接力」) to Your Agent
+### Workflow A: Encrypted Cloud Async Relay (Recommended)
 
-1. The agent runs `relay handoff <project>` to scan local Git/session facts and print the pre-departure checklist.
-2. The agent writes or updates `HANDOFF.md` in the project root (a concise summary of completed work, current state, next steps, and how to verify), records notes via `relay note`, and registers the active session (`relay session add <project> latest --tool <claude|codex|anti>`).
-3. Command blocks are handled strictly by safety tag:
-   - **Read-only (`只读`)**: Safe for the agent to run directly.
-   - **Local-only (`只改本机`)**: Shown to you for confirmation before execution.
-   - **Remote-write (`写入远程`)**: Never executed by the agent; printed verbatim for you to run in your own terminal.
-4. Each completed item is checked off with `relay check <project> pre <key>`, followed by `relay depart <project>` to mark the project as **in transit**.
+#### 1. Leaving Machine A: Say *"接力"* to Your Agent (or run CLI)
 
-### Arriving at the Other Machine: Say *"pickup"* (or「接棒」) to Your Agent
+1. Update `HANDOFF.md`, record notes (`relay note`), and optionally register the active session (`relay session add my-app latest --tool <claude|codex|anti>`).
+2. Encrypt, upload, and verify remotely:
+   ```bash
+   relay send my-app --to b
+   ```
+3. Once remote verification succeeds, the CLI (and Web UI banner) outputs **`已交棒，可以关机`** (*"Handoff complete, safe to shut down"*). You can power off Machine A immediately.
 
-1. The agent runs `relay pickup <project>` to display handoff context and the post-arrival checklist.
-2. You and the agent step through the arrival commands (verifying a clean working tree, pulling/fetching or applying the bundle/patch, restoring any extra local files).
-3. The agent reads `GEMINI.md` / `AGENTS.md`, `HANDOFF.md`, and the next action in the ledger.
-4. Once complete, the agent runs `relay arrive <project>`, transferring ownership to the receiving device and re-scanning local Git state.
+#### 2. Arriving at Machine B: Say *"接棒"* to Your Agent (or open the **待接棒** tab in Web UI)
 
-### Returning to the Original Machine
+1. Check incoming encrypted packages and decrypted previews:
+   ```bash
+   relay inbox
+   ```
+2. Verify signatures, decrypt in temp staging, restore code + staged + unstaged + untracked files, and upload a signed receipt:
+   ```bash
+   # First time receiving this project on Machine B:
+   relay receive <relay_id> --path /path/to/my-app
 
-Run a reverse handoff so your code catches up, then resume your original local session natively:
+   # Subsequent receives:
+   relay receive <relay_id>
 
-- **Claude Code**: `claude --resume <id>` (or `claude --continue`)
-- **Codex**: `codex resume <id>` (or `codex resume --last`)
-- **Antigravity**: `agy --conversation <id>` (or `agy --continue`, or open from the Desktop / IDE sidebar)
+   # If local directory has unsynced edits, original dir is preserved untouched; receive into a new dir:
+   relay receive <relay_id> --into /path/to/my-app-incoming
+   ```
+3. Browse or grep full archived conversations across **Claude Code**, **Codex**, and **Antigravity**:
+   ```bash
+   relay transcripts my-app                        # List archived sessions
+   relay transcripts my-app --session <session_id> # Read full Markdown conversation
+   relay transcripts my-app --tool codex           # Filter by agent tool
+   relay transcripts my-app --grep "auth token"    # Search across all archived turns
+   ```
+
+---
+
+### Workflow B: Manual Checklist Relay (Zero Dependencies / Offline)
+
+Without `PyNaCl` or `rclone`, configure a drop folder (`relay device --drop <dir>`) and use the 4 manual transport modes (`remote`, `bundle`, `patch`, `folder`):
+
+1. **Leaving**: `relay handoff <project>` → step through safety-tagged commands (`只读` / `只改本机` / `写入远程`) → `relay check <project> pre <key>` → `relay depart <project>`.
+2. **Arriving**: `relay pickup <project>` → apply bundle/patch/fetch commands → `relay arrive <project>`.
+3. **Returning to the Original Machine**: After syncing code back, resume native local sessions on their origin machine via `claude --resume <id>`, `codex resume <id>`, or `agy --conversation <id>`.
 
 ---
 
 ## CLI Reference
 
-When `PROJECT` is omitted, `relay` resolves the project from your current working directory.
+When `PROJECT` is omitted, `relay` resolves the project from your current working directory (transparently handling macOS `/var` ↔ `/private/var` symlinks and Unicode NFC/NFD paths).
 
 | Command | Description |
 |---|---|
-| `init [--device a\|b] [--ledger PATH] [--host]` | Write machine-local config (`~/.relay-desk/config.json`); `--host` records this machine's hostname. Creates an empty ledger if missing. |
-| `status [PROJECT] [--json]` | Without `PROJECT`: one-line summary per project. With `PROJECT`: full details, 4-tier board, and registered sessions with resume commands. |
-| `scan [PROJECT] [--all]` | Refresh local Git branch, dirty count, remotes, state file presence, and session metadata. `--all` scans all projects plus global agent state. |
+| `init [--device a\|b] [--ledger PATH] [--host]` | Write machine-local config (`~/.relay-desk/config.json`); `--host` records hostname. Creates ledger if missing. |
+| `cloud remotes [--rclone-config PATH] [--json]` | Discover configured `rclone` remote names on this machine. |
+| `pair [--remote R] [--root P] [--provider rclone\|local] [--rclone-config PATH] [--accept] [--status] [--json]` | Inspect cloud pairing status, publish signed Ed25519/X25519 public keys, verify the shared SAS fingerprint, and pin peer keys (`--accept`). |
+| `send [PROJECT] [--to a\|b] [--json]` | Run secret gate & session gap checks, encrypt & upload package + signed `ready.json`, verify remotely, and output **`已交棒，可以关机`**. |
+| `inbox [--json]` | Sync signed receipts for sent relays and list claimable incoming relays addressed to this device. |
+| `receive RELAY_ID [--path DIR] [--into DIR] [--json]` | Verify & unpack incoming relay (`--path` on first receive; preserves dirty local dir and supports `--into` new dir) and upload signed `receipt.json`. |
+| `transcripts [PROJECT] [--session ID] [--tool claude\|codex\|anti] [--grep PATTERN] [--json]` | List, read full Markdown, or search deduplicated historical conversations across Claude Code, Codex, and Antigravity. |
+| `status [PROJECT] [--json]` | One-line overview per project, or full details, 4-tier board, and session resume commands for `PROJECT`. |
+| `scan [PROJECT] [--all]` | Refresh local Git facts, state file presence, and discovered sessions (`--all` scans all projects + global state). |
 | `add NAME --path PATH [--tool T] [--id ID]` | Register a project and scan immediately (`T`: `claude`, `codex`, `anti`, `both`, `claude+anti`, `codex+anti`, `all`). |
 | `set PROJECT [...]` | Update project fields (`--path-here`, `--path-other`, `--alt-path`, `--tool`, `--status`, `--transport`, `--worktree`, `--device`). |
 | `note PROJECT [...]` | Record `--last` task, `--next` action, `--note`, and `--verify` (`none\|pass\|partial\|fail`, `--verify-cmd`, `--verify-note`). |
-| `sessions [PROJECT] [--tool claude\|codex\|anti] [--json]` | Discover local sessions for this project on the current machine (`*` marks registered sessions). |
+| `sessions [PROJECT] [--tool claude\|codex\|anti] [--json]` | List discovered local sessions on this machine (`*` marks registered sessions). |
 | `session add PROJECT ID\|latest [--tool T] [...]` | Register a session (`latest` selects the newest discovered session for that tool). |
 | `session rm PROJECT ID` | Unregister a session by internal ID or `sessionId`. |
-| `handoff PROJECT [--transport T] [--to D]` | Start a handoff from this device and print the pre-departure checklist & commands. |
-| `plan PROJECT [--phase pre\|post] [--json]` | Reprint the checklist and command blocks for an active handoff. |
-| `check PROJECT pre\|post KEY [--undo]` | Check or uncheck a checklist item. |
-| `depart PROJECT` | Mark the active handoff as `transit`. |
-| `pickup PROJECT` | Print handoff context, source sessions, and the post-arrival checklist on the receiving machine. |
-| `arrive PROJECT` | Complete the handoff, append to history (last 10 kept), switch project `device`, and scan. |
-| `cancel PROJECT` | Cancel an in-progress handoff. |
-| `conflict add PROJECT --kind K [...]` | Log a conflict (`both`, `merge`, `instr`, `session`, `other`) with files and resolution notes. |
-| `device [--which a\|b] [--name N] [--os O] [--drop PATH]` | View or update device settings (`windows`, `mac`, `linux`, and drop folder path). |
-| `export [FILE]` | Export ledger backup JSON to `FILE` or stdout. |
-| `import FILE [--replace]` | Import a backup (merges by project ID keeping newer `updatedAt` by default; `--replace` overwrites all). |
-| `serve [--port 8765] [--no-open]` | Start the local web UI server bound strictly to `127.0.0.1`. |
+| `handoff PROJECT [--transport T] [--to D]` | Start a manual checklist handoff and print pre-departure commands. |
+| `plan PROJECT [--phase pre\|post] [--json]` | Reprint checklist & command blocks for an active manual handoff. |
+| `check PROJECT pre\|post KEY [--undo]` | Check or uncheck a manual checklist item. |
+| `depart PROJECT` / `pickup PROJECT` / `arrive PROJECT` | Mark manual handoff in transit, view arrival checklist on receiver, or complete arrival. |
+| `cancel PROJECT` | Cancel an active handoff marker. |
+| `conflict add PROJECT --kind K [...]` | Log a conflict (`both`, `merge`, `instr`, `session`, `other`). |
+| `device [--which a\|b] [--name N] [--os O] [--drop PATH]` | View or update device settings (`windows`, `mac`, `linux`, and drop folder). |
+| `export [FILE]` / `import FILE [--replace]` | Export or import ledger JSON backups (merges by `updatedAt` by default; `--replace` overwrites). |
+| `serve [--port 8765] [--no-open]` | Start the loopback-only Web UI (`127.0.0.1`) with Inbox (**待接棒**), Cloud Pairing, and Transcript Viewer. |
 | `install-skills [--claude] [--codex] [--anti] [--dry-run] [--force]` | Install agent skills with `{{RELAY}}` resolved for this machine. |
 
 ---
 
-## Antigravity, Claude Code & Codex Migration Notes (Win ↔ Mac)
+## Security & Design Guarantees
 
-- **Workspace Instructions & Customizations**: `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.claude/`, `.codex/`, and `.agents/` (skills, rules, plugins, hooks) are tracked in project state and travel cleanly via Git or `git bundle`.
-- **Global Rules, Skills & MCP Configs**: In the Web UI's **Registry (状态登记)** tab, toggling on detected global items (`~/.claude/skills/`, `~/.codex/skills/`, `~/.gemini/GEMINI.md`, `~/.gemini/config/skills/`, `~/.gemini/config/mcp_config.json`, etc.) generates bidirectional PowerShell (`robocopy` / `Copy-Item` / `Compare-Object`) and macOS zsh (`rsync` / `cp` / `diff`) commands. Configs that may contain machine-specific paths or tokens are copied side-by-side for diffing rather than blindly overwritten.
-- **Session Transcripts & Antigravity `brain/` Artifacts**: Local sessions remain on their origin machine by default. If you explicitly set a session's carry mode to `transcript`, `relay-desk` generates drop-folder copy commands for Claude Code `.jsonl` transcripts or Antigravity `~/.gemini/antigravity/brain/<id>/` directories (preserving implementation plans, reports, and `transcript.jsonl` for the new session to reference without touching local SQLite session databases).
-
----
-
-## Security & Design Guarantees (What It Never Does)
-
-1. **No Network Access**: `relay-desk` never runs `git push`, `git fetch`, `git pull`, or any outbound network request. It only prints commands.
-2. **Never Reads Credentials**: `~/.claude.json`, `.credentials.json`, `~/.codex/auth.json`, `~/.gemini/oauth_creds.json`, `.env`, and SSH keys are checked for file existence *only*—never opened, copied, or recorded.
-3. **Summaries Are Not Sessions**: `HANDOFF.md` and `ledger.json` are honest context summaries. Local sessions can only be resumed natively on the machine where they were created.
-4. **Never Mutates Your Repos**: `relay` only writes to `ledger.json` (and its `.lock` file), `~/.relay-desk/config.json`, and the skill folders targeted by `install-skills`.
-5. **Loopback-Protected Web UI**: `relay serve` binds exclusively to `127.0.0.1`, validates `Host`, `Origin`, and `X-Relay-Desk` headers, and serves no arbitrary filesystem paths.
+1. **Never Pushes to Your Code Git Remote**: Neither `relay` nor its agent skills ever run `git push` against your code repository's remote. Cloud relay uploads only libsodium-encrypted packages to your explicitly paired cloud storage root.
+2. **Strict Credential Gate**: `~/.claude.json`, `.credentials.json`, `~/.codex/auth.json`, `~/.gemini/oauth_creds.json`, `.env`, and private keys are never opened or copied; if private keys or credential files are found tracked in Git history or staged changes, `relay send` aborts before uploading.
+3. **Summaries & Transcripts Are Not Native Live Sessions**: `HANDOFF.md` and `relay transcripts` provide honest context summaries and searchable full dialogue archives without corrupting local SQLite session databases or falsely claiming native session restoration.
+4. **Temp-Staged Verification & Non-Destructive Receive**: Signatures, SHA-256 hashes, and `secretstream` frames are verified in a temp directory before touching any project path, and dirty local directories are never overwritten.
+5. **Loopback-Protected Web UI**: `relay serve` binds strictly to `127.0.0.1` and enforces `Host`, `Origin`, and `X-Relay-Desk: 1` checks.
 
 ---
 
@@ -174,9 +225,14 @@ relay-desk/
 ├── relay / relay.cmd        # POSIX / Windows wrapper scripts
 ├── relay-desk.html          # Single-file Web UI (also compatible as a claude.ai Artifact)
 ├── relaydesk/
-│   ├── ledger.py            # Atomic JSON storage, file locking, normalisation & device lookup
+│   ├── ledger.py            # Atomic JSON storage, file locking, path canonicalisation & device lookup
 │   ├── scan.py              # Read-only Git facts, state presence & Claude/Codex/Antigravity session discovery
-│   ├── plan.py              # 4-tier classification, handoff checklists & cross-OS shell command generator
+│   ├── plan.py              # 4-tier classification, manual checklists & cross-OS shell command generator
+│   ├── storage.py           # Pluggable StorageProvider interface + rclone & LocalDir adapters
+│   ├── crypto.py            # Device identity, SAS pairing fingerprints, Ed25519 & libsodium secretstream
+│   ├── conversations.py     # Full visible conversation extraction, gap detection, dedup archive & grep
+│   ├── packager.py          # Git bundle + staged/unstaged/untracked packager, secret gate & clean unpacker
+│   ├── relay_engine.py      # Async cloud relay orchestrator (pair, 2-phase send, inbox, receive & receipts)
 │   ├── cli.py               # Command-line interface & skill installer
 │   └── server.py            # Local 127.0.0.1 HTTP server & JSON API
 ├── skills/
@@ -184,8 +240,9 @@ relay-desk/
 │   ├── codex/relay-desk/    # Codex SKILL.md template
 │   └── anti/relay-desk/     # Antigravity SKILL.md template
 ├── docs/
-│   └── SPEC.md              # Architecture & module specification
-└── tests/                   # Standard-library unittest suite
+│   ├── SPEC.md              # Architecture & module specification
+│   └── STORAGE_PROVIDER.md  # Pluggable cloud storage contract & adapter guide
+└── tests/                   # Standard-library unittest & end-to-end acceptance suite
 ```
 
 ## Running Tests

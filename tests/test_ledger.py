@@ -3,6 +3,7 @@ import os
 import tempfile
 import threading
 import time
+import unicodedata
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -321,6 +322,183 @@ class TestDevices(Base):
         i = L.new_id("s_")
         self.assertRegex(i, r"^s_[a-z0-9]{8}$")
         self.assertNotEqual(i, L.new_id("s_"))
+
+
+class TestCanonicalAndCrossPlatformPaths(Base):
+    def test_empty_and_symlink_resolution(self):
+        self.assertEqual(L.canonical_local_path(""), "")
+        real_dir = self.dir / "真实目录" / "proj"
+        real_dir.mkdir(parents=True)
+        link_dir = self.dir / "link_proj"
+        os.symlink(str(real_dir), str(link_dir))
+        self.assertEqual(L.canonical_local_path(str(link_dir)), L.canonical_local_path(str(real_dir)))
+        self.assertEqual(
+            L.canonical_local_path(str(link_dir / "nonexistent_leaf")),
+            L.canonical_local_path(str(real_dir / "nonexistent_leaf")),
+        )
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlink aliases")
+    def test_var_and_tmp_symlink_aliases_in_find_project(self):
+        led = L.load("missing.json")
+        cfg = led["config"]
+        # Test real symlink + macOS /tmp <-> /private/tmp & /var <-> /private/var if present
+        real_outer = os.path.realpath(str(self.dir / "outer"))
+        os.makedirs(os.path.join(real_outer, "inner"), exist_ok=True)
+        link_outer = str(self.dir / "link_outer")
+        os.symlink(real_outer, link_outer)
+        led["projects"] = [
+            L.norm_project({"id": "outer-p", "name": "Outer", "paths": {"b": real_outer}}, cfg),
+            L.norm_project({"id": "inner-p", "name": "Inner", "paths": {"b": os.path.join(link_outer, "inner")}}, cfg),
+        ]
+        # Symlinked inner has shorter raw string if /private/... vs link, but longer canonical path
+        self.assertEqual(L.find_project(led, None, os.path.join(real_outer, "inner", "sub"))["id"], "inner-p")
+        self.assertEqual(L.find_project(led, None, os.path.join(link_outer, "x"))["id"], "outer-p")
+
+        if os.path.realpath("/tmp") == "/private/tmp":
+            led2 = L.load("missing.json")
+            led2["projects"] = [
+                L.norm_project({"id": "tmp-proj", "name": "Tmp", "paths": {"b": "/tmp/relay_alias_check_proj"}}, cfg),
+                L.norm_project({"id": "var-proj", "name": "Var", "paths": {"b": "/private/var/folders/relay_alias_check"}}, cfg),
+            ]
+            self.assertEqual(L.find_project(led2, None, "/private/tmp/relay_alias_check_proj/src")["id"], "tmp-proj")
+            self.assertEqual(L.find_project(led2, None, "/tmp/relay_alias_check_proj")["id"], "tmp-proj")
+            if os.path.realpath("/var") == "/private/var":
+                self.assertEqual(L.find_project(led2, None, "/var/folders/relay_alias_check/sub")["id"], "var-proj")
+
+    def test_chinese_and_nfc_nfd_paths(self):
+        led = L.load("missing.json")
+        cfg = led["config"]
+        nfd_name = unicodedata.normalize("NFD", "测试工作区/café_双机接力项目")
+        nfc_name = unicodedata.normalize("NFC", "测试工作区/café_双机接力项目")
+        self.assertNotEqual(nfd_name, nfc_name)
+        nfd_path = os.path.join(str(self.dir), nfd_name)
+        nfc_path = os.path.join(str(self.dir), nfc_name)
+        led["projects"] = [
+            L.norm_project({"id": "zh-proj", "name": "中文双机项目", "paths": {"a": r"D:\工作区\双机接力项目", "b": nfd_path}}, cfg),
+        ]
+        self.assertEqual(L.find_project(led, None, os.path.join(nfc_path, "核心模块"))["id"], "zh-proj")
+        led["projects"][0]["paths"]["b"] = nfc_path
+        self.assertEqual(L.find_project(led, None, os.path.join(nfd_path, "核心模块"))["id"], "zh-proj")
+
+    @unittest.skipIf(os.name == "nt", "Foreign Windows paths on POSIX")
+    def test_foreign_windows_paths_on_posix_not_mangled(self):
+        self.assertEqual(L.canonical_local_path("D:/Developer/Scala cw/"), r"d:\developer\scala cw")
+        self.assertEqual(L.canonical_local_path("C:/"), "c:\\")
+        self.assertEqual(L.canonical_local_path("C:\\"), "c:\\")
+        self.assertEqual(L.canonical_local_path(r"\\Server\Share\Proj\\"), r"\\server\share\proj")
+        self.assertNotIn(os.getcwd(), L.canonical_local_path(r"D:\Developer\Proj"))
+        self.assertTrue(L._inside("d:/developer/proj/sub", r"D:\Developer\Proj"))
+        self.assertFalse(L._inside(r"D:\Developer\ProjOther", r"D:\Developer\Proj"))
+        self.assertTrue(L._inside(r"C:\foo", "c:/"))
+        self.assertFalse(L._inside(r"D:\foo", "c:/"))
+
+    def test_foreign_posix_paths_on_mocked_windows(self):
+        with mock.patch.object(os, "name", "nt"):
+            self.assertEqual(L.canonical_local_path("/Users/tony/proj/"), "/Users/tony/proj")
+            self.assertEqual(L.canonical_local_path("/"), "/")
+            self.assertTrue(L._inside("/Users/tony/proj/sub", "/Users/tony/proj"))
+            self.assertFalse(L._inside("/Users/tony/proj2", "/Users/tony/proj"))
+
+
+class TestPathValidation(Base):
+    def test_check_case_collisions(self):
+        self.assertEqual(L.check_case_collisions(["Foo.txt", "foo.txt"]), [("Foo.txt", "foo.txt")])
+        self.assertEqual(
+            L.check_case_collisions(["./sub\\Readme.MD", "sub/readme.md", "sub/README.md"]),
+            [
+                ("sub/README.md", "sub/Readme.MD"),
+                ("sub/README.md", "sub/readme.md"),
+                ("sub/Readme.MD", "sub/readme.md"),
+            ],
+        )
+        # Exact duplicates or NFC/NFD equivalents with identical case are NOT collisions
+        nfd = unicodedata.normalize("NFD", "中文/café.md")
+        nfc = unicodedata.normalize("NFC", "中文/café.md")
+        self.assertEqual(L.check_case_collisions(["same.txt", "same.txt", nfd, nfc]), [])
+        self.assertEqual(
+            L.check_case_collisions(["中文目录/Config.JSON", "中文目录/config.json"]),
+            [("中文目录/Config.JSON", "中文目录/config.json")],
+        )
+
+    def test_check_windows_path_issues(self):
+        clean = ["src/main.py", "测试工作区/说明文档.md", "CONSOLE.txt", "COM10.log", "LPT0.txt", ".env.example"]
+        self.assertEqual(L.check_windows_path_issues(clean), [])
+
+        bad = [
+            "dir/a:b.txt",
+            "what?.md",
+            "ctrl/bad\x07name.txt",
+            "trail /ok.txt",
+            "dir/dot.",
+            "CON",
+            "sub/prn.txt",
+            "sub/Aux.json",
+            "NUL.tar.gz",
+            "com1.log",
+            "LPT9",
+        ]
+        issues = L.check_windows_path_issues(bad)
+        self.assertEqual([p for p, _ in issues], bad)
+        reasons = dict(issues)
+        self.assertIn("非法字符", reasons["dir/a:b.txt"])
+        self.assertIn("控制字符", reasons["ctrl/bad\x07name.txt"])
+        self.assertIn("空格或句点", reasons["trail /ok.txt"])
+        self.assertIn("空格或句点", reasons["dir/dot."])
+        self.assertIn("保留设备名", reasons["CON"])
+        self.assertIn("保留设备名", reasons["sub/prn.txt"])
+        self.assertIn("保留设备名", reasons["com1.log"])
+        self.assertIn("保留设备名", reasons["LPT9"])
+
+
+class TestSameOsDevices(Base):
+    def test_all_desktop_os_combinations_and_same_os_lookup(self):
+        combos = [
+            ("windows", "mac"),
+            ("mac", "linux"),
+            ("windows", "linux"),
+            ("mac", "mac"),
+            ("windows", "windows"),
+            ("linux", "linux"),
+        ]
+        for os_a, os_b in combos:
+            cfg = L.norm_config({
+                "devices": [
+                    {"id": "a", "name": "A", "os": os_a},
+                    {"id": "b", "name": "B", "os": os_b},
+                ]
+            })
+            self.assertEqual([d["id"] for d in cfg["devices"]], ["a", "b"])
+            self.assertEqual((cfg["devices"][0]["os"], cfg["devices"][1]["os"]), (os_a, os_b))
+            self.assertEqual(L.other(cfg, "a")["id"], "b")
+            self.assertEqual(L.other(cfg, "b")["id"], "a")
+
+        # Same-OS pair (mac + mac): ambiguous without explicit device/identity/unique host
+        led = L.load("missing.json")
+        led["config"] = L.norm_config({
+            "devices": [
+                {"id": "a", "name": "Mac Studio", "os": "mac", "host": "same-host"},
+                {"id": "b", "name": "MacBook Pro", "os": "mac", "host": "same-host"},
+            ]
+        })
+        with mock.patch.object(L, "hostname", return_value="same-host"), mock.patch.object(L, "local_os", return_value="mac"):
+            self.assertIsNone(L.here(led))
+            self.assertEqual(L.here(led, {"device": "a"}), "a")
+            self.assertEqual(L.here(led, {"device": "b"}), "b")
+            # Unique host resolves cleanly
+            led["config"]["devices"][1]["host"] = "macbook-pro"
+            self.assertEqual(L.here(led), "a")
+        with mock.patch.object(L, "hostname", return_value="macbook-pro.local"), mock.patch.object(L, "local_os", return_value="mac"):
+            self.assertEqual(L.here(led), "b")
+
+        # Disambiguation via identity.json on same-OS pair
+        led["config"]["devices"][0]["host"] = ""
+        led["config"]["devices"][1]["host"] = ""
+        led["config"]["devices"][1]["deviceId"] = "dev_b_123"
+        ident_file = L.local_dir() / "identity.json"
+        ident_file.parent.mkdir(parents=True, exist_ok=True)
+        ident_file.write_text(json.dumps({"deviceId": "dev_b_123", "alias": "b"}), encoding="utf-8")
+        with mock.patch.object(L, "hostname", return_value="unknown"), mock.patch.object(L, "local_os", return_value="mac"):
+            self.assertEqual(L.here(led), "b")
 
 
 if __name__ == "__main__":

@@ -819,5 +819,166 @@ class TestServe(CliBase):
         self.assertIn("relaydesk.server", err)
 
 
+class TestCloudRelayCli(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cloud = self.root / "cloud"
+        self.cloud.mkdir()
+        self.home_a = self.root / "home_a"
+        self.uhome_a = self.root / "uhome_a"
+        self.led_a = self.root / "led_a.json"
+        self.home_b = self.root / "home_b"
+        self.uhome_b = self.root / "uhome_b"
+        self.led_b = self.root / "led_b.json"
+
+    def _run_as(self, dev, *argv):
+        home = self.home_a if dev == "a" else self.home_b
+        uhome = self.uhome_a if dev == "a" else self.uhome_b
+        led = self.led_a if dev == "a" else self.led_b
+        env = {k: v for k, v in os.environ.items() if not k.startswith("RELAY_DESK_")}
+        env.update(
+            {
+                "RELAY_DESK_HOME": str(home),
+                "RELAY_DESK_LEDGER": str(led),
+                "RELAY_DESK_DEVICE": dev,
+                "RELAY_DESK_USER_HOME": str(uhome),
+            }
+        )
+        o, e = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True):
+            with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
+                code = cli.main([str(x) for x in argv])
+        return code, o.getvalue(), e.getvalue()
+
+    def test_cloud_remotes_text_and_json(self):
+        rc_conf = self.root / "rclone.conf"
+        rc_conf.write_text("[alice_drive]\ntype = local\n\n[bob_s3]\ntype = local\n", encoding="utf-8")
+        from relaydesk import storage
+
+        if storage.has_rclone():
+            code, out_txt, _ = self._run_as("a", "cloud", "remotes", "--rclone-config", rc_conf)
+            self.assertEqual(code, 0)
+            self.assertIn("alice_drive", out_txt)
+            self.assertIn("bob_s3", out_txt)
+            code, out_js, _ = self._run_as("a", "cloud", "remotes", "--rclone-config", rc_conf, "--json")
+            self.assertEqual(code, 0)
+            parsed = json.loads(out_js)
+            self.assertTrue(parsed["hasRclone"])
+            self.assertEqual(parsed["remotes"], ["alice_drive", "bob_s3"])
+
+        with mock.patch("relaydesk.storage.has_rclone", return_value=False):
+            code, out_none, _ = self._run_as("a", "cloud", "remotes", "--json")
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out_none), {"hasRclone": False, "remotes": []})
+
+    def test_pair_send_inbox_receive_transcripts_cli_workflow(self):
+        self._run_as("a", "init", "--device", "a")
+        self._run_as("b", "init", "--device", "b")
+
+        code, out_st, _ = self._run_as("a", "pair", "--status")
+        self.assertEqual(code, 0)
+        self.assertIn("未配置", out_st)
+
+        code, out_pa1, _ = self._run_as("a", "pair", "--provider", "local", "--root", self.cloud)
+        self.assertEqual(code, 0)
+        self.assertIn("等待另一台设备", out_pa1)
+
+        code, out_pb1, _ = self._run_as("b", "pair", "--provider", "local", "--root", self.cloud)
+        self.assertEqual(code, 0)
+        self.assertIn("配对指纹：", out_pb1)
+
+        code, out_pa_check, _ = self._run_as("a", "pair")
+        self.assertEqual(code, 0)
+        self.assertIn("配对指纹：", out_pa_check)
+
+        code, out_pa_acc, _ = self._run_as("a", "pair", "--accept", "--json")
+        self.assertEqual(code, 0)
+        js_a = json.loads(out_pa_acc)
+        self.assertTrue(js_a["paired"])
+
+        code, out_pb_acc, _ = self._run_as("b", "pair", "--accept", "--json")
+        self.assertEqual(code, 0)
+        js_b = json.loads(out_pb_acc)
+        self.assertTrue(js_b["paired"])
+        self.assertEqual(js_a["pairFingerprint"], js_b["pairFingerprint"])
+
+        # Create project & Claude session on A
+        proj_a = self.root / "proj_a"
+        proj_a.mkdir()
+        (proj_a / "app.py").write_text("print('v1')\n", encoding="utf-8")
+        (proj_a / "HANDOFF.md").write_text("## Handoff\nNext: add tests\n", encoding="utf-8")
+        self._run_as("a", "add", "CLI Relay App", "--path", proj_a, "--id", "cli-app")
+        self._run_as("a", "note", "cli-app", "--last", "初始化项目", "--next", "补测试")
+
+        from relaydesk import scan
+
+        cdir = self.uhome_a / ".claude" / "projects" / scan.enc_path(str(proj_a))
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "sess_cli_1.jsonl").write_text(
+            json.dumps({"type": "summary", "summary": "CLI 会话测试"}, ensure_ascii=False)
+            + "\n"
+            + json.dumps({"type": "user", "message": {"role": "user", "content": "特殊检索词_ALPHA"}}, ensure_ascii=False)
+            + "\n"
+            + json.dumps({"type": "assistant", "message": {"role": "assistant", "content": "收到 ALPHA"}}, ensure_ascii=False)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        # Send on A (text mode must output "已交棒，可以关机")
+        code, out_send, err_send = self._run_as("a", "send", "cli-app", "--to", "b")
+        self.assertEqual(code, 0, err_send)
+        self.assertIn("已交棒，可以关机", out_send)
+
+        # Inbox on B (text & json)
+        code, out_ib_txt, _ = self._run_as("b", "inbox")
+        self.assertEqual(code, 0)
+        self.assertIn("CLI Relay App", out_ib_txt)
+        code, out_ib_js, _ = self._run_as("b", "inbox", "--json")
+        self.assertEqual(code, 0)
+        ib_data = json.loads(out_ib_js)
+        self.assertEqual(len(ib_data["incoming"]), 1)
+        rid = ib_data["incoming"][0]["relayId"]
+
+        # First receive on B without --path -> exit 1
+        code, _, err_np = self._run_as("b", "receive", rid)
+        self.assertEqual(code, 1)
+        self.assertIn("--path", err_np)
+
+        # Receive on B with --path
+        proj_b = self.root / "proj_b"
+        code, out_recv, err_recv = self._run_as("b", "receive", rid, "--path", proj_b)
+        self.assertEqual(code, 0, err_recv)
+        self.assertIn("接棒完成", out_recv)
+        self.assertEqual((proj_b / "app.py").read_text(encoding="utf-8"), "print('v1')\n")
+
+        # Duplicate receive -> exit 1
+        code, _, err_dup = self._run_as("b", "receive", rid)
+        self.assertEqual(code, 1)
+        self.assertIn("不能重复领取", err_dup)
+
+        # Transcripts list, --session, --grep, --json on B
+        code, out_tr_list, _ = self._run_as("b", "transcripts", "cli-app")
+        self.assertEqual(code, 0)
+        self.assertIn("sess_cli_1", out_tr_list)
+
+        code, out_tr_md, _ = self._run_as("b", "transcripts", "cli-app", "--session", "sess_cli_1")
+        self.assertEqual(code, 0)
+        self.assertIn("特殊检索词_ALPHA", out_tr_md)
+
+        code, out_tr_grep, _ = self._run_as("b", "transcripts", "cli-app", "--grep", "特殊检索词_ALPHA")
+        self.assertEqual(code, 0)
+        self.assertIn("sess_cli_1", out_tr_grep)
+
+        # Send back from B in --json mode (must contain "message": "已交棒，可以关机")
+        (proj_b / "app.py").write_text("print('v2')\n", encoding="utf-8")
+        code, out_send_js, err_s2 = self._run_as("b", "send", "cli-app", "--to", "a", "--json")
+        self.assertEqual(code, 0, err_s2)
+        send2_data = json.loads(out_send_js)
+        self.assertEqual(send2_data["message"], "已交棒，可以关机")
+        self.assertEqual(send2_data["parentRelayId"], rid)
+
+
 if __name__ == "__main__":
     unittest.main()
