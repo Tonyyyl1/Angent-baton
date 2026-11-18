@@ -12,6 +12,7 @@ import re
 import tempfile
 import time
 import unicodedata
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -224,6 +225,7 @@ DEFAULT_CLOUD: Dict[str, Any] = {
 DEFAULT_RELAY_STATE: Dict[str, Any] = {
     "pendingSends": {},
     "sentRelays": {},
+    "appliedReceives": {},
     "receivedRelays": {},
     "projectBaselines": {},
 }
@@ -260,7 +262,7 @@ def _is_cloud_configured(cloud_cfg: Dict[str, Any]) -> bool:
 def _load_relay_state(local_home: Path) -> Dict[str, Any]:
     raw = _read_json_file(local_home / "relay_state.json", DEFAULT_RELAY_STATE)
     out = copy.deepcopy(DEFAULT_RELAY_STATE)
-    for k in ("pendingSends", "sentRelays", "receivedRelays", "projectBaselines"):
+    for k in DEFAULT_RELAY_STATE:
         if isinstance(raw.get(k), dict):
             out[k] = copy.deepcopy(raw[k])
     return out
@@ -277,6 +279,27 @@ def _update_relay_state(local_home: Path, fn) -> Dict[str, Any]:
         fn(st)
         _save_relay_state(local_home, st)
         return st
+
+
+@contextmanager
+def _workspace_operation(local_home: Path):
+    """Hold an OS lock across a send or receive, including slow cloud transfers."""
+    local_home.mkdir(parents=True, exist_ok=True)
+    with (local_home / "workspace-operation.lock").open("a+b") as lock:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            raise RelayError("本机有其他交棒或接棒操作正在进行，请稍后重试。", code="busy") from e
+        yield
+        # The OS releases the lock on close, including when the process exits.
 
 
 def _resolve_ctx(
@@ -830,6 +853,34 @@ def _require_paired_context(
     return base, led_path, local_cfg, led, here_id, cloud, identity, peer_desc, provider
 
 
+def _download_json(provider, key: str) -> dict:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "object.json"
+        provider.download(key, str(path))
+        with path.open(encoding="utf-8-sig") as stream:
+            return json.load(stream)
+
+
+def _verify_outgoing_ready(raw_ready, relay_id, project_id, identity, peer_desc) -> Tuple[dict, dict]:
+    ready = crypto.verify_json(raw_ready, identity["verifyPublicKey"], expected_device_id=identity["deviceId"])
+    expected = {
+        "relayId": relay_id,
+        "fromAlias": identity["alias"],
+        "fromDeviceId": identity["deviceId"],
+        "toAlias": peer_desc["alias"],
+        "toDeviceId": peer_desc["deviceId"],
+        "packageKey": "relays/%s/package.enc" % relay_id,
+    }
+    if any(ready.get(key) != value for key, value in expected.items()):
+        raise crypto.TamperError("交接包 %s 的已发布记录与本机发送记录不符。" % relay_id)
+    if not re.fullmatch(r"[0-9a-f]{64}", str(ready.get("packageSha256") or "")):
+        raise crypto.TamperError("交接包 %s 的已发布记录缺少有效的包摘要。" % relay_id)
+    meta = crypto.decrypt_meta(ready.get("meta") or {}, identity, peer_desc)
+    if meta.get("projectId") != project_id:
+        raise crypto.TamperError("交接包 %s 的项目编号与本机发送记录不符。" % relay_id)
+    return ready, meta
+
+
 # ---------------------------------------------------------------- 3. sync_receipts
 
 
@@ -867,10 +918,24 @@ def sync_receipts(
                     peer_desc["verifyPublicKey"],
                     expected_device_id=peer_desc.get("deviceId"),
                 )
+                expected_digest = info.get("packageSha256")
+                if not expected_digest:
+                    # Older local relay state can recover the digest from our signed ready record.
+                    raw_ready = _download_json(provider, "relays/%s/ready.json" % rid)
+                    ready, _ = _verify_outgoing_ready(raw_ready, rid, info.get("projectId"), identity, peer_desc)
+                    expected_digest = ready["packageSha256"]
             except (st_mod.StorageError, crypto.CryptoError, OSError, ValueError, UnicodeDecodeError):
                 continue
 
-            if verified.get("relayId") != rid:
+            expected_receipt = {
+                "relayId": rid,
+                "projectId": info.get("projectId"),
+                "fromAlias": identity["alias"],
+                "toAlias": info.get("toAlias"),
+                "receiverDeviceId": info.get("toDeviceId"),
+                "packageSha256": expected_digest,
+            }
+            if any(verified.get(key) != value for key, value in expected_receipt.items()):
                 continue
 
             proj_id = str(info.get("projectId") or verified.get("projectId") or "")
@@ -914,6 +979,7 @@ def sync_receipts(
                 if isinstance(entry, dict):
                     entry["acked"] = True
                     entry["ackedAt"] = acked_at
+                    entry["packageSha256"] = expected_digest
 
             _update_relay_state(base, _mark_state)
             synced.append(
@@ -940,13 +1006,15 @@ def send_project(
     local_home: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Package, encrypt, two-phase atomically upload, and verify a project handoff."""
-    st_mod = _storage_mod()
+    ctx = _require_paired_context(ledger_path, local, local_home)
+    with _workspace_operation(ctx[0]):
+        return _send_project(project_key, to_alias, cwd, ctx)
+
+
+def _send_project(project_key, to_alias, cwd, ctx) -> Dict[str, Any]:
     conv_mod = _conversations_mod()
     pkg_mod = _packager_mod()
-
-    base, led_path, local_cfg, _led0, here_id, _cloud, identity, peer_desc, provider = _require_paired_context(
-        ledger_path, local, local_home
-    )
+    base, led_path, local_cfg, _led0, here_id, _cloud, identity, peer_desc, provider = ctx
 
     sync_receipts(provider, identity, peer_desc, led_path, local_cfg, local_home=base)
     led = L.load(led_path)
@@ -959,6 +1027,22 @@ def send_project(
         raise RelayError("--to 不能是出发的本机设备自己（%s）。" % dest_alias)
     if dest_alias not in ("a", "b"):
         raise RelayError("无效的目标设备别名：%s（只能是 a 或 b）。" % dest_alias)
+
+    pending = _load_relay_state(base)["pendingSends"].get(proj_id) or {}
+    same_recipient = pending.get("toAlias") == dest_alias and pending.get("toDeviceId") == peer_desc["deviceId"]
+    if same_recipient and pending.get("relayId"):
+        if pending.get("prepared"):
+            return _publish_prepared_send(ctx, proj_id, pending["relayId"], pending["prepared"], retry=True)
+        if not pending.get("checkpointBeforeReady"):
+            # Earlier builds could publish a package without saving a local checkpoint.
+            # Adopt it if visible, and use a new ID when its publication status is unknown.
+            old_id = pending["relayId"]
+            try:
+                old_ready = _download_json(provider, "relays/%s/ready.json" % old_id)
+            except _storage_mod().ObjectNotFoundError:
+                pass
+            else:
+                return _publish_prepared_send(ctx, proj_id, old_id, {"ready": old_ready}, retry=True)
 
     if proj.get("device") != here_id:
         owner_cfg = L.dev(led["config"], proj.get("device"))
@@ -999,32 +1083,23 @@ def send_project(
     # 2. Run secret gate BEFORE allocating or uploading
     pkg_mod.scan_secrets_before_pack(proj_path, is_git=facts.get("isGit"))
 
-    # 3. Reuse pending relayId if an earlier upload to the same target was interrupted
-    alloc_box: Dict[str, str] = {}
+    if not (same_recipient and pending.get("checkpointBeforeReady")):
+        day_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+        pending = {
+            "relayId": L.new_id("r_%s_" % day_str),
+            "toAlias": dest_alias,
+            "toDeviceId": peer_desc["deviceId"],
+            "parentRelayId": str(proj.get("lastRelayId") or ""),
+            "checkpointBeforeReady": True,
+        }
 
-    def _alloc_or_reuse(st_obj: Dict[str, Any]) -> None:
-        pending = st_obj.setdefault("pendingSends", {})
-        cur = pending.get(proj_id)
-        if isinstance(cur, dict) and cur.get("toAlias") == dest_alias and cur.get("relayId"):
-            alloc_box["relayId"] = str(cur["relayId"])
-            alloc_box["parentRelayId"] = str(cur.get("parentRelayId") or "")
-        else:
-            day_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-            rid = L.new_id("r_%s_" % day_str)
-            parent_id = str(proj.get("lastRelayId") or "")
-            pending[proj_id] = {
-                "relayId": rid,
-                "toAlias": dest_alias,
-                "toDeviceId": peer_desc["deviceId"],
-                "parentRelayId": parent_id,
-                "createdAt": L.now_iso(),
-            }
-            alloc_box["relayId"] = rid
-            alloc_box["parentRelayId"] = parent_id
+        def _save_pending(st_obj: Dict[str, Any]) -> None:
+            st_obj["pendingSends"][proj_id] = pending
 
-    _update_relay_state(base, _alloc_or_reuse)
-    relay_id = alloc_box["relayId"]
-    parent_id = alloc_box["parentRelayId"]
+        _update_relay_state(base, _save_pending)
+
+    relay_id = pending["relayId"]
+    parent_id = pending["parentRelayId"]
 
     handoff_md_text = ""
     handoff_md_file = Path(proj_path) / "HANDOFF.md"
@@ -1063,14 +1138,12 @@ def send_project(
         target_os = str(peer_desc.get("os") or dest_dev_cfg.get("os") or "")
 
     pkg_key = "relays/%s/package.enc" % relay_id
-    ready_key = "relays/%s/ready.json" % relay_id
     created_at = L.now_iso()
     session_count = len(conv_bundle.get("entries") or [])
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tar_path = os.path.join(tmpdir, "payload.tar.gz")
         enc_path = os.path.join(tmpdir, "package.enc")
-        ready_path = os.path.join(tmpdir, "ready.json")
 
         pack_info = pkg_mod.build_payload(
             proj_path,
@@ -1081,16 +1154,7 @@ def send_project(
         )
         envelope = crypto.encrypt_package(tar_path, enc_path, identity, peer_desc)
 
-        # Two-phase atomic publish: Phase 1 -> package.enc upload + remote size verification
-        provider.upload(enc_path, pkg_key)
-        st_pkg = provider.stat(pkg_key)
-        if st_pkg is None or st_pkg.size != envelope["packageSize"]:
-            raise st_mod.StorageError(
-                "云端加密交接包校验失败（%s）：远端大小 %s 与本地 %d 不一致。"
-                % (pkg_key, getattr(st_pkg, "size", None), envelope["packageSize"])
-            )
-
-        # Two-phase atomic publish: Phase 2 -> signed ready.json upload + remote verification
+        # Prepare the exact marker before any attempt to publish it.
         meta_plain = {
             "projectId": proj_id,
             "projectName": proj_work["name"],
@@ -1116,23 +1180,75 @@ def send_project(
                 "meta": meta_enc,
             }
         )
-        signed_ready = crypto.sign_json(
-            ready_unsigned,
-            identity["signPrivateKey"],
-            signer_device_id=identity["deviceId"],
-        )
-        _atomic_write_json(Path(ready_path), signed_ready)
-        provider.upload(ready_path, ready_key)
-        st_ready = provider.stat(ready_key)
-        if st_ready is None:
-            raise st_mod.StorageError("云端就绪标记（%s）上传后校验未找到该文件。" % ready_key)
+        prepared = {
+            "ready": crypto.sign_json(ready_unsigned, identity["signPrivateKey"], signer_device_id=identity["deviceId"]),
+            "sourcePath": proj_path,
+            "facts": facts,
+            "presence": pres,
+            "excludedFiles": pack_info.get("excludedFiles") or [],
+            "baseline": {
+                "headCommit": pack_info.get("headCommit") or "",
+                "folderHashes": pack_info.get("folderHashes") or {},
+                "gitSnapshotHash": _compute_git_baseline_fingerprint(proj_path) if pack_info["mode"] == "git" else "",
+            },
+        }
+        provider.upload(enc_path, pkg_key)
+        _verify_published_package(provider, ready_unsigned)
+
+        def _checkpoint(st_obj: Dict[str, Any]) -> None:
+            st_obj["pendingSends"][proj_id]["prepared"] = prepared
+
+        _update_relay_state(base, _checkpoint)
+
+    return _publish_prepared_send(ctx, proj_id, relay_id, prepared)
+
+
+def _verify_published_package(provider, ready: dict) -> None:
+    pkg_key = ready["packageKey"]
+    remote_package = provider.stat(pkg_key)
+    if remote_package is None or remote_package.size != ready.get("packageSize"):
+        raise _storage_mod().StorageError("云端加密交接包缺失或大小不一致：%s" % pkg_key)
+    if remote_package.sha256 and remote_package.sha256.lower() != ready["packageSha256"]:
+        raise _storage_mod().StorageError("云端加密交接包的 SHA-256 不一致：%s" % pkg_key)
+
+
+def _publish_prepared_send(ctx, proj_id, relay_id, prepared, retry=False) -> Dict[str, Any]:
+    base, led_path, _, _, here_id, _, identity, peer_desc, provider = ctx
+    signed_ready = prepared["ready"]
+    ready, meta = _verify_outgoing_ready(signed_ready, relay_id, proj_id, identity, peer_desc)
+    ready_key = "relays/%s/ready.json" % relay_id
+    ready_visible = False
+    if retry:
+        _verify_published_package(provider, ready)
+        try:
+            remote_ready = _download_json(provider, ready_key)
+        except _storage_mod().ObjectNotFoundError:
+            pass
+        else:
+            if remote_ready != signed_ready:
+                raise crypto.TamperError("交接包 %s 已有不同的云端就绪记录。" % relay_id)
+            ready_visible = True
+
+    if not ready_visible:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "ready.json"
+            _atomic_write_json(path, signed_ready)
+            provider.upload(str(path), ready_key)
+            if provider.stat(ready_key) is None:
+                raise _storage_mod().StorageError("云端就绪标记（%s）上传后校验未找到该文件。" % ready_key)
+
+    dest_alias = ready["toAlias"]
+    parent_id = str(ready.get("parentRelayId") or "")
+    created_at = ready["createdAt"]
+    baseline = prepared.get("baseline") or {}
 
     def _upd_sender_ledger(l: Dict[str, Any]) -> None:
         for p in l.get("projects") or []:
             if p.get("id") != proj_id:
                 continue
-            p.setdefault("paths", {})[here_id] = proj_path
-            _apply_local_facts_to_project(p, here_id, facts, pres)
+            if prepared.get("sourcePath"):
+                p.setdefault("paths", {})[here_id] = prepared["sourcePath"]
+            _apply_local_facts_to_project(p, here_id, prepared.get("facts"), prepared.get("presence"))
             p["lastRelayId"] = relay_id
             p["handoff"] = {
                 "tag": relay_id,
@@ -1142,16 +1258,14 @@ def send_project(
                 "transport": "cloud",
                 "state": "transit",
                 "parentRelayId": parent_id,
-                "hadDirty": bool(p.get("dirty")),
-                "branch": p.get("branch") or "",
-                "baseCommit": pack_info.get("headCommit") or "",
+                "hadDirty": bool(meta.get("dirty")),
+                "branch": meta.get("branch") or "",
+                "baseCommit": baseline.get("headCommit") or "",
                 "createdAt": created_at,
             }
             L.touch(p, here_id)
 
     L.update(led_path, _upd_sender_ledger)
-
-    git_snap_sent = _compute_git_baseline_fingerprint(proj_path) if pack_info.get("mode") == "git" else ""
 
     def _finalize_send_state(st_obj: Dict[str, Any]) -> None:
         st_obj.setdefault("pendingSends", {}).pop(proj_id, None)
@@ -1159,15 +1273,13 @@ def send_project(
             "projectId": proj_id,
             "toAlias": dest_alias,
             "toDeviceId": peer_desc["deviceId"],
+            "packageSha256": ready["packageSha256"],
             "sentAt": created_at,
             "acked": False,
             "ackedAt": "",
         }
-        st_obj.setdefault("projectBaselines", {})[proj_id] = {
-            "headCommit": pack_info.get("headCommit") or "",
-            "folderHashes": pack_info.get("folderHashes") or {},
-            "gitSnapshotHash": git_snap_sent,
-        }
+        # A legacy pending send has no trustworthy workspace baseline.
+        st_obj["projectBaselines"][proj_id] = baseline
 
     _update_relay_state(base, _finalize_send_state)
 
@@ -1176,14 +1288,14 @@ def send_project(
         "relayId": relay_id,
         "parentRelayId": parent_id,
         "projectId": proj_id,
-        "projectName": proj_work["name"],
+        "projectName": meta["projectName"],
         "from": here_id,
         "to": dest_alias,
-        "packageSize": envelope["packageSize"],
-        "packageSha256": envelope["packageSha256"],
-        "sessionCount": session_count,
-        "excludedFiles": pack_info.get("excludedFiles") or [],
-        "message": HANDOFF_DONE_MESSAGE,
+        "packageSize": ready["packageSize"],
+        "packageSha256": ready["packageSha256"],
+        "sessionCount": meta.get("sessionCount", 0),
+        "excludedFiles": prepared.get("excludedFiles") or [],
+        "message": HANDOFF_DONE_MESSAGE + ("。本次重试沿用原交接包。" if retry else ""),
     }
 
 
@@ -1364,15 +1476,19 @@ def receive_relay(
     if not RELAY_ID_RE.match(relay_id) or relay_id in (".", ".."):
         raise RelayError("无效的交接包编号：%r" % relay_id)
 
+    ctx = _require_paired_context(ledger_path, local, local_home)
+    with _workspace_operation(ctx[0]):
+        return _receive_relay(relay_id, target_path, into_path, ctx)
+
+
+def _receive_relay(relay_id, target_path, into_path, ctx) -> Dict[str, Any]:
     st_mod = _storage_mod()
     conv_mod = _conversations_mod()
     pkg_mod = _packager_mod()
-
-    base, led_path, local_cfg, _led0, here_id, _cloud, identity, peer_desc, provider = _require_paired_context(
-        ledger_path, local, local_home
-    )
+    base, led_path, _, _, here_id, _, identity, peer_desc, provider = ctx
 
     state = _load_relay_state(base)
+    applied = state["appliedReceives"].get(relay_id)
     rec_entry = (state.get("receivedRelays") or {}).get(relay_id)
 
     # 1. CRITICAL Recovery: local apply already succeeded earlier, only receipt upload failed!
@@ -1485,14 +1601,8 @@ def receive_relay(
         existing_here_raw = (existing_proj.get("paths") or {}).get(here_id) if existing_proj else ""
         existing_here_canon = _canon_local_path(existing_here_raw) if existing_here_raw else ""
 
-        if into_path:
-            raw_dest = into_path
-        elif target_path:
-            raw_dest = target_path
-        elif existing_here_raw:
-            raw_dest = existing_here_raw
-        else:
-            raw_dest = ""
+        requested_dest = into_path or target_path
+        raw_dest = requested_dest or (applied or {}).get("targetPath") or existing_here_raw
 
         if not raw_dest:
             raise NeedTargetPathError(
@@ -1502,62 +1612,132 @@ def receive_relay(
             )
 
         dest_dir = _canon_local_path(raw_dest)
-        baseline = (state.get("projectBaselines") or {}).get(proj_id) or {}
-        use_baseline = baseline if (not existing_here_canon or dest_dir == existing_here_canon) else {}
-
-        try:
-            pkg_mod.check_target_clean_for_receive(
-                dest_dir,
-                manifest,
-                expected_base_head=use_baseline.get("headCommit") or None,
-                expected_folder_hashes=(
-                    use_baseline["folderHashes"] if "folderHashes" in use_baseline else None
-                ),
-            )
-        except pkg_mod.TargetDirtyError as e:
-            # If dest_dir is 100% identical to the snapshot recorded when this machine last
-            # handed off / received this Git project, and all reasons are merely those
-            # previously handed-off uncommitted changes (no diverged local commits), allow clean apply!
-            unchanged_handoff_baseline = False
-            saved_git_snap = use_baseline.get("gitSnapshotHash") or ""
-            if (
-                manifest.get("mode") == "git"
-                and saved_git_snap
-                and os.path.isdir(dest_dir)
-                and _compute_git_baseline_fingerprint(dest_dir) == saved_git_snap
+        if applied:
+            if applied["packageSha256"] != verified_ready["packageSha256"] or applied["projectId"] != proj_id:
+                raise crypto.TamperError("交接包 %s 与本机已恢复的交接内容不一致。" % relay_id)
+            if applied.get("newDestination") and not os.path.lexists(applied["targetPath"]):
+                # The checkpoint was written before a new workspace was moved into place.
+                applied = None
+            elif (
+                dest_dir != applied["targetPath"] or not os.path.isdir(dest_dir)
+                or _directory_identity(dest_dir) != applied["directoryIdentity"]
             ):
-                reasons_list = getattr(e, "reasons", []) or []
-                if reasons_list and all(
-                    isinstance(r, str) and r.startswith(("存在本地未跟踪文件：", "存在本地未提交改动"))
-                    for r in reasons_list
-                ):
-                    unchanged_handoff_baseline = True
+                raise RelayError("交接包 %s 已恢复到 %s，请在该目录完成接棒。" % (relay_id, applied["targetPath"]))
+        if not applied:
+            for pending_id, entry in state["appliedReceives"].items():
+                if pending_id != relay_id and (entry["projectId"] == proj_id or entry["targetPath"] == dest_dir):
+                    raise RelayError("此项目或目录有待完成的接棒，请先运行 relay receive %s。" % pending_id)
+            _check_receive_target(pkg_mod, manifest, state, proj_id, dest_dir, existing_here_canon, proj_name)
 
-            if not unchanged_handoff_baseline:
-                msg = str(e)
-                if not into_path and "--into" not in msg:
-                    msg = "%s 原目录已完整保留；如需保留本地改动并接棒到新目录，请加 --into <新目录>。" % msg
-                dirty_err = pkg_mod.TargetDirtyError(
-                    msg,
-                    target_path=getattr(e, "target_path", dest_dir),
-                    reasons=getattr(e, "reasons", []),
-                )
-                dirty_err.project_id = proj_id
-                dirty_err.project_name = proj_name
-                raise dirty_err
+            # Archive writes can fail; complete them before modifying the workspace.
+            conv_res = conv_mod.merge_and_save_archive(base, proj_id, conv_bundle)
+            with _restore_workspace(pkg_mod, staging_dir, dest_dir) as (workspace, apply_res):
+                git_snapshot = _compute_git_baseline_fingerprint(workspace) if apply_res["mode"] == "git" else ""
+                applied = {
+                    "targetPath": dest_dir,
+                    "projectId": proj_id,
+                    "packageSha256": verified_ready["packageSha256"],
+                    "receivedAt": L.now_iso(),
+                    "mode": apply_res["mode"],
+                    "branch": apply_res["branch"],
+                    "newDestination": workspace != dest_dir,
+                    "directoryIdentity": _directory_identity(workspace),
+                    "baseline": {
+                        "headCommit": apply_res["headCommit"],
+                        "folderHashes": apply_res["folderHashes"],
+                        "gitSnapshotHash": git_snapshot,
+                    },
+                    "conversations": {key: conv_res[key] for key in ("total", "added", "updated", "skipped", "archiveDir")},
+                }
 
-        # 5. Apply verified payload to destination directory
-        apply_res = pkg_mod.apply_verified_payload(staging_dir, dest_dir)
+                def _checkpoint_apply(st_obj: Dict[str, Any]) -> None:
+                    st_obj["appliedReceives"][relay_id] = applied
 
-    # 6. Merge full conversation archive locally
-    conv_res = conv_mod.merge_and_save_archive(base, proj_id, conv_bundle)
+                _update_relay_state(base, _checkpoint_apply)
 
-    # 7. Scan applied destination directory & update local ledger.json
+    return _finish_receive(ctx, relay_id, verified_ready, metadata, applied)
+
+
+def _directory_identity(path: str) -> List[int]:
+    info = os.stat(path)
+    return [info.st_dev, info.st_ino]
+
+
+@contextmanager
+def _restore_workspace(pkg_mod, staging_dir: str, dest_dir: str):
+    if os.path.lexists(dest_dir):
+        yield dest_dir, pkg_mod.apply_verified_payload(staging_dir, dest_dir)
+        return
+
+    # Build new workspaces on the destination filesystem. A failed apply leaves the
+    # requested path available for a retry.
+    parent = Path(dest_dir).parent
+    parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".relay-receive-", dir=str(parent)) as work:
+        workspace = os.path.join(work, "workspace")
+        result = pkg_mod.apply_verified_payload(staging_dir, workspace)
+        yield workspace, result
+        if os.path.lexists(dest_dir):
+            raise RelayError("接收期间目标路径已被创建，请确认后重试：%s" % dest_dir)
+        os.rename(workspace, dest_dir)
+
+
+def _check_receive_target(pkg_mod, manifest, state, proj_id, dest_dir, existing_here_canon, proj_name) -> None:
+    baseline = (state.get("projectBaselines") or {}).get(proj_id) or {}
+    use_baseline = baseline if (not existing_here_canon or dest_dir == existing_here_canon) else {}
+
+    try:
+        pkg_mod.check_target_clean_for_receive(
+            dest_dir,
+            manifest,
+            expected_base_head=use_baseline.get("headCommit") or None,
+            expected_folder_hashes=(
+                use_baseline["folderHashes"] if "folderHashes" in use_baseline else None
+            ),
+        )
+    except pkg_mod.TargetDirtyError as e:
+        # If dest_dir is 100% identical to the snapshot recorded when this machine last
+        # handed off / received this Git project, and all reasons are merely those
+        # previously handed-off uncommitted changes (no diverged local commits), allow clean apply!
+        unchanged_handoff_baseline = False
+        saved_git_snap = use_baseline.get("gitSnapshotHash") or ""
+        if (
+            manifest.get("mode") == "git"
+            and saved_git_snap
+            and os.path.isdir(dest_dir)
+            and _compute_git_baseline_fingerprint(dest_dir) == saved_git_snap
+        ):
+            reasons_list = getattr(e, "reasons", []) or []
+            if reasons_list and all(
+                isinstance(r, str) and r.startswith(("存在本地未跟踪文件：", "存在本地未提交改动"))
+                for r in reasons_list
+            ):
+                unchanged_handoff_baseline = True
+
+        if not unchanged_handoff_baseline:
+            msg = str(e)
+            if "--into" not in msg:
+                msg = "%s 原目录已完整保留；如需保留本地改动并接棒到新目录，请加 --into <新目录>。" % msg
+            dirty_err = pkg_mod.TargetDirtyError(
+                msg,
+                target_path=getattr(e, "target_path", dest_dir),
+                reasons=getattr(e, "reasons", []),
+            )
+            dirty_err.project_id = proj_id
+            dirty_err.project_name = proj_name
+            raise dirty_err
+
+
+def _finish_receive(ctx, relay_id, verified_ready, metadata, applied) -> Dict[str, Any]:
+    base, led_path, _, led, here_id, _, identity, _, provider = ctx
+    dest_dir = applied["targetPath"]
+    proj_id = applied["projectId"]
+    proj_name = str(metadata.get("name") or proj_id)
     user_h = os.environ.get("RELAY_DESK_USER_HOME") or None
     facts = scan.git_facts(dest_dir)
     pres = scan.presence(dest_dir, home=user_h)
     from_alias = str(verified_ready.get("fromAlias") or L.other(led["config"], here_id)["id"])
-    received_at = L.now_iso()
+    received_at = applied["receivedAt"]
 
     def _upd_receiver_ledger(l: Dict[str, Any]) -> None:
         target_p = None
@@ -1604,9 +1784,9 @@ def receive_relay(
         )
         target_p["lastRelayId"] = relay_id
         target_p["handoff"] = None
-        target_p["history"] = (
-            list(target_p.get("history") or [])
-            + [
+        history = list(target_p.get("history") or [])
+        if not any(entry.get("relayId") == relay_id for entry in history):
+            target_p["history"] = (history + [
                 {
                     "tag": relay_id,
                     "relayId": relay_id,
@@ -1616,8 +1796,7 @@ def receive_relay(
                     "transport": "cloud",
                     "doneAt": received_at,
                 }
-            ]
-        )[-10:]
+            ])[-10:]
         _apply_local_facts_to_project(target_p, here_id, facts, pres)
         L.touch(target_p, here_id)
 
@@ -1648,32 +1827,20 @@ def receive_relay(
         "from": from_alias,
         "to": here_id,
         "targetPath": dest_dir,
-        "mode": apply_res.get("mode", ""),
-        "branch": apply_res.get("branch") or facts.get("branch") or "",
-        "headCommit": apply_res.get("headCommit") or "",
+        "mode": applied["mode"],
+        "branch": applied["branch"] or facts.get("branch") or "",
+        "headCommit": applied["baseline"]["headCommit"],
         "lastTask": str(metadata.get("lastTask") or ""),
         "nextAction": str(metadata.get("nextAction") or ""),
         "note": str(metadata.get("note") or ""),
         "verify": copy.deepcopy(metadata.get("verify") or {"state": "none", "cmd": "", "note": ""}),
-        "conversations": {
-            "total": conv_res.get("total", 0),
-            "added": conv_res.get("added", 0),
-            "updated": conv_res.get("updated", 0),
-            "skipped": conv_res.get("skipped", 0),
-            "archiveDir": conv_res.get("archiveDir", ""),
-        },
+        "conversations": applied["conversations"],
         "message": "接棒完成：%s 已就绪（%s）" % (proj_name, dest_dir),
     }
 
-    git_snap_recv = _compute_git_baseline_fingerprint(dest_dir) if apply_res.get("mode") == "git" else ""
-
-    # 8. CRITICAL: Persist receivedRelays with receiptUploaded=False BEFORE uploading receipt.json!
     def _record_local_applied(st_obj: Dict[str, Any]) -> None:
-        st_obj.setdefault("projectBaselines", {})[proj_id] = {
-            "headCommit": apply_res.get("headCommit") or "",
-            "folderHashes": apply_res.get("folderHashes") or {},
-            "gitSnapshotHash": git_snap_recv,
-        }
+        st_obj["appliedReceives"].pop(relay_id, None)
+        st_obj["projectBaselines"][proj_id] = applied["baseline"]
         st_obj.setdefault("receivedRelays", {})[relay_id] = {
             "projectId": proj_id,
             "targetPath": dest_dir,

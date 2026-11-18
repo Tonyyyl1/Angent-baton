@@ -237,6 +237,218 @@ class TestPairingAndStatus(RelayEngineTestBase):
 
 
 class TestFullRoundTripAndFaultRecovery(RelayEngineTestBase):
+    def test_receive_protects_ignored_files_and_conflicting_git_refs(self):
+        self.pair_both()
+        repo_a = self.create_git_project_on_a()
+        (repo_a / ".gitignore").write_text("local-notes.txt\n", encoding="utf-8")
+        _git(repo_a, "add", ".gitignore")
+        _git(repo_a, "commit", "-m", "add ignore rule")
+        _git(repo_a, "branch", "side")
+        _git(repo_a, "tag", "snapshot")
+        with self.env_a():
+            rid = relay_engine.send_project("demo")["relayId"]
+        protected = self.root / "only-local-credentials" / "README.md"
+        protected.mkdir(parents=True)
+        (protected / ".env").write_text("local settings\n", encoding="utf-8")
+        with self.env_b():
+            with self.assertRaisesRegex(packager.TargetDirtyError, "凭据"):
+                relay_engine.receive_relay(rid, target_path=str(protected.parent))
+        self.assertTrue((protected / ".env").exists())
+        repo_b = self.root / "local-checkout"
+        _git(self.root, "clone", "--quiet", str(repo_a), str(repo_b))
+        local_notes = repo_b / "local-notes.txt"
+        local_notes.write_text("only on B\n", encoding="utf-8")
+        self.assertEqual(_git(repo_b, "status", "--porcelain"), "")
+        with self.env_b():
+            with self.assertRaisesRegex(packager.TargetDirtyError, "local-notes.txt"):
+                relay_engine.receive_relay(rid, target_path=str(repo_b))
+        self.assertEqual(local_notes.read_text(encoding="utf-8"), "only on B\n")
+        local_notes.unlink()
+
+        _git(repo_b, "checkout", "-b", "side")
+        _git(repo_b, "commit", "--allow-empty", "-m", "only on B")
+        local_commit = _git(repo_b, "rev-parse", "HEAD").strip()
+        _git(repo_b, "tag", "--force", "snapshot")
+        _git(repo_b, "checkout", "main")
+        with self.env_b():
+            with self.assertRaisesRegex(packager.TargetDirtyError, "side"):
+                relay_engine.receive_relay(rid, target_path=str(repo_b))
+            self.assertEqual(_git(repo_b, "rev-parse", "side").strip(), local_commit)
+            _git(repo_b, "branch", "-D", "side")
+            with self.assertRaisesRegex(packager.TargetDirtyError, "snapshot"):
+                relay_engine.receive_relay(rid, target_path=str(repo_b))
+            self.assertEqual(_git(repo_b, "rev-parse", "snapshot").strip(), local_commit)
+            other = self.root / "incoming"
+            self.assertTrue(relay_engine.receive_relay(rid, into_path=str(other))["ok"])
+            self.assertEqual(_git(repo_b, "rev-parse", "snapshot").strip(), local_commit)
+
+    def test_receive_fast_forwards_branch_and_keeps_local_only_refs(self):
+        self.pair_both()
+        repo_a = self.create_git_project_on_a()
+        repo_b = self.root / "local-checkout"
+        _git(self.root, "clone", "--quiet", str(repo_a), str(repo_b))
+        initial = _git(repo_b, "rev-parse", "HEAD").strip()
+        _git(repo_b, "branch", "local-only")
+        _git(repo_b, "tag", "local-tag")
+        _git(repo_b, "config", "fetch.prune", "true")
+        _git(repo_b, "config", "fetch.pruneTags", "true")
+        _git(repo_a, "commit", "--allow-empty", "-m", "fast-forward")
+        _git(repo_a, "tag", "incoming-tag")
+        with self.env_a():
+            rid = relay_engine.send_project("demo")["relayId"]
+        with self.env_b():
+            self.assertTrue(relay_engine.receive_relay(rid, target_path=str(repo_b))["ok"])
+        self.assertEqual(_git(repo_b, "rev-parse", "HEAD"), _git(repo_a, "rev-parse", "HEAD"))
+        self.assertEqual(_git(repo_b, "rev-parse", "local-only").strip(), initial)
+        self.assertEqual(_git(repo_b, "rev-parse", "local-tag").strip(), initial)
+
+    def test_retry_after_ready_is_visible_recovers_the_original_package(self):
+        self.pair_both()
+        repo_a = self.create_git_project_on_a()
+        real_stat = storage.LocalDirProvider.stat
+
+        def lose_ready_response(provider, key):
+            if key.endswith("/ready.json"):
+                raise storage.StorageError("lost ready verification response")
+            return real_stat(provider, key)
+
+        with self.env_a(), mock.patch.object(storage.LocalDirProvider, "stat", lose_ready_response):
+            with self.assertRaisesRegex(storage.StorageError, "lost ready"):
+                relay_engine.send_project("demo")
+
+        repo_b = self.root / "received"
+        with self.env_b():
+            [published] = relay_engine.list_inbox()["incoming"]
+            rid = published["relayId"]
+            relay_engine.receive_relay(rid, target_path=str(repo_b))
+        ready_dir = self.cloud_dir / "relays" / rid
+        original_ciphertext = (ready_dir / "package.enc").read_bytes()
+        original_ready = (ready_dir / "ready.json").read_bytes()
+        (repo_a / "keep.txt").write_text("new local work\n", encoding="utf-8")
+
+        with self.env_a():
+            retried = relay_engine.send_project("demo")
+            self.assertEqual(retried["relayId"], rid)
+            self.assertEqual(retried["packageSha256"], published["packageSha256"])
+            self.assertEqual((ready_dir / "package.enc").read_bytes(), original_ciphertext)
+            self.assertEqual((ready_dir / "ready.json").read_bytes(), original_ready)
+            self.assertEqual((repo_b / "keep.txt").read_text(encoding="utf-8"), "line1\n")
+            self.assertEqual([r["relayId"] for r in relay_engine.list_inbox()["syncedReceipts"]], [rid])
+
+    def test_receipt_must_match_the_published_package_digest(self):
+        self.pair_both()
+        self.create_git_project_on_a()
+        with self.env_a():
+            rid = relay_engine.send_project("demo")["relayId"]
+        with self.env_b():
+            relay_engine.receive_relay(rid, target_path=str(self.root / "received"))
+        receipt_path = self.cloud_dir / "relays" / rid / "receipt.json"
+        original_receipt = receipt_path.read_text(encoding="utf-8")
+        identity = json.loads((self.home_b / "identity.json").read_text(encoding="utf-8"))
+        receipt = crypto.verify_json(json.loads(original_receipt), identity["verifyPublicKey"])
+        receipt["packageSha256"] = "0" * 64
+        replacement = crypto.sign_json(receipt, identity["signPrivateKey"], signer_device_id=identity["deviceId"])
+        receipt_path.write_text(json.dumps(replacement), encoding="utf-8")
+        with self.env_a():
+            with self.subTest(state="current"):
+                self.assertEqual(relay_engine.list_inbox()["syncedReceipts"], [])
+                self.assertEqual(L.load(self.led_a)["projects"][0]["device"], "a")
+            with self.subTest(state="legacy"):
+                relay_engine._update_relay_state(
+                    self.home_a, lambda state: state["sentRelays"][rid].pop("packageSha256"),
+                )
+                self.assertEqual(relay_engine.list_inbox()["syncedReceipts"], [])
+            receipt_path.write_text(original_receipt, encoding="utf-8")
+            self.assertEqual([r["relayId"] for r in relay_engine.list_inbox()["syncedReceipts"]], [rid])
+
+    def test_failed_new_workspace_apply_does_not_leave_partial_target(self):
+        self.pair_both()
+        self.create_git_project_on_a()
+        with self.env_a():
+            rid = relay_engine.send_project("demo")["relayId"]
+        target = self.root / "destination"
+
+        def apply_partway(_staging, workspace):
+            Path(workspace).mkdir()
+            (Path(workspace) / "partial.txt").write_text("partial", encoding="utf-8")
+            raise OSError("workspace unavailable")
+
+        with self.env_b():
+            with mock.patch.object(packager, "apply_verified_payload", side_effect=apply_partway):
+                with self.assertRaisesRegex(OSError, "workspace unavailable"):
+                    relay_engine.receive_relay(rid, target_path=str(target))
+            self.assertFalse(target.exists())
+            self.assertEqual(L.load(self.led_b)["projects"], [])
+            self.assertTrue(relay_engine.receive_relay(rid, target_path=str(target))["ok"])
+            self.assertFalse((target / "partial.txt").exists())
+
+    def test_retry_after_new_workspace_rename_fails_uses_saved_target(self):
+        self.pair_both()
+        self.create_git_project_on_a()
+        with self.env_a():
+            rid = relay_engine.send_project("demo")["relayId"]
+        target = self.root / "destination"
+        with self.env_b():
+            with mock.patch.object(relay_engine.os, "rename", side_effect=OSError("rename interrupted")):
+                with self.assertRaisesRegex(OSError, "rename interrupted"):
+                    relay_engine.receive_relay(rid, target_path=str(target))
+            self.assertFalse(target.exists())
+            self.assertTrue(relay_engine.receive_relay(rid)["ok"])
+            self.assertTrue((target / "README.md").is_file())
+
+    def test_archive_write_failure_leaves_destination_untouched_and_retryable(self):
+        self.pair_both()
+        folder = self.root / "source-folder"
+        folder.mkdir()
+        (folder / "notes.txt").write_text("handoff contents\n", encoding="utf-8")
+        L.update(self.led_a, lambda ledger: ledger["projects"].append(L.norm_project(
+            {"name": "Folder", "id": "folder", "device": "a", "paths": {"a": str(folder)}},
+            ledger["config"],
+        )))
+        with self.env_a():
+            rid = relay_engine.send_project("folder")["relayId"]
+        target = self.root / "destination"
+        with self.env_b():
+            with mock.patch.object(conversations, "merge_and_save_archive", side_effect=OSError("archive unavailable")):
+                with self.assertRaisesRegex(OSError, "archive unavailable"):
+                    relay_engine.receive_relay(rid, target_path=str(target))
+            self.assertFalse(target.exists())
+            self.assertEqual(L.load(self.led_b)["projects"], [])
+            self.assertFalse((self.cloud_dir / "relays" / rid / "receipt.json").exists())
+            self.assertTrue(relay_engine.receive_relay(rid, target_path=str(target))["ok"])
+            self.assertEqual((target / "notes.txt").read_text(encoding="utf-8"), "handoff contents\n")
+
+    def test_receive_resumes_after_ledger_failure_without_reapplying_workspace(self):
+        self.pair_both()
+        repo_a = self.create_git_project_on_a()
+        (repo_a / "new.txt").write_text("untracked from A\n", encoding="utf-8")
+        with self.env_a():
+            rid = relay_engine.send_project("demo")["relayId"]
+        target = self.root / "destination"
+        with self.env_b():
+            with mock.patch.object(L, "update", side_effect=L.LedgerError("ledger unavailable")):
+                with self.assertRaisesRegex(L.LedgerError, "ledger unavailable"):
+                    relay_engine.receive_relay(rid, target_path=str(target))
+            self.assertTrue((target / "new.txt").is_file())
+            self.assertEqual(L.load(self.led_b)["projects"], [])
+            self.assertFalse((self.cloud_dir / "relays" / rid / "receipt.json").exists())
+            (target / "new.txt").write_text("edited after interruption\n", encoding="utf-8")
+
+            real_update = L.update
+
+            def lose_ledger_result(path, update):
+                real_update(path, update)
+                raise L.LedgerError("ledger result lost")
+
+            with mock.patch.object(packager, "apply_verified_payload", side_effect=AssertionError("reapplied")):
+                with mock.patch.object(L, "update", side_effect=lose_ledger_result):
+                    with self.assertRaisesRegex(L.LedgerError, "ledger result lost"):
+                        relay_engine.receive_relay(rid)
+                self.assertTrue(relay_engine.receive_relay(rid)["ok"])
+            self.assertEqual((target / "new.txt").read_text(encoding="utf-8"), "edited after interruption\n")
+            [project] = L.load(self.led_b)["projects"]
+            self.assertEqual([entry["relayId"] for entry in project["history"]], [rid])
+
     def test_git_round_trip_a_to_b_to_a_with_staged_unstaged_untracked_and_3_tools(self):
         self.pair_both()
         repo_a = self.create_git_project_on_a()

@@ -1611,6 +1611,43 @@ def _directory_is_effectively_empty(target_path: str) -> bool:
     return True
 
 
+def _fetch_bundle_refs(target_path: str, bundle_path: str, refs: dict, dry_run: bool = False) -> Tuple[int, str]:
+    args = [
+        "fetch", "--atomic", "--no-tags", "--no-prune", "--no-prune-tags",
+        "--no-recurse-submodules", "--no-write-fetch-head", "--update-head-ok",
+    ]
+    if dry_run:
+        args.append("--dry-run")
+    refspecs = [
+        namespace + "*:" + namespace + "*"
+        for namespace in ("refs/heads/", "refs/tags/")
+        if any(ref.startswith(namespace) for ref in refs)
+    ]
+    if not refspecs:
+        return 0, ""
+    rc, _, err = _run_git_text(target_path, args + [bundle_path] + refspecs)
+    return rc, err.strip()
+
+
+def _preserved_file_conflict(target_path: str, incoming_paths: List[str]) -> Optional[str]:
+    for rel in incoming_paths:
+        parts = rel.split("/")
+        dest = target_path
+        for part in parts:
+            dest = os.path.join(dest, part)
+            if _is_secret_filename(part) and os.path.lexists(dest) and (
+                os.path.islink(dest) or not os.path.isdir(dest)
+            ):
+                return os.path.relpath(dest, target_path)
+        # Restoring a file here would replace the entire existing directory.
+        if os.path.isdir(dest) and not os.path.islink(dest):
+            for parent, _, files in os.walk(dest):
+                for name in files:
+                    if _is_secret_filename(name):
+                        return os.path.relpath(os.path.join(parent, name), target_path)
+    return None
+
+
 def check_target_clean_for_receive(
     target_path: str,
     payload_manifest: dict,
@@ -1644,6 +1681,13 @@ def check_target_clean_for_receive(
             reasons=["目标路径已存在且不是目录"],
         )
 
+    conflict = _preserved_file_conflict(target_path, rel_paths)
+    if conflict:
+        reason = "交接包路径与本机保留的凭据文件冲突：%s" % conflict
+        raise TargetDirtyError(
+            "%s。请用 --into 接收至新目录。" % reason, target_path=target_path, reasons=[reason],
+        )
+
     if _directory_is_effectively_empty(target_path):
         return
 
@@ -1656,6 +1700,24 @@ def check_target_clean_for_receive(
             has_local_commits, local_head = _git_has_commits(target_path)
             incoming_has_commits = bool(payload_manifest.get("hasCommits"))
             incoming_head = payload_manifest.get("headCommit") or ""
+
+            rc_ignored, ignored_paths, ignored_error = _run_git_bytes(
+                target_path, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"]
+            )
+            if rc_ignored != 0:
+                reasons.append("无法检查目标仓库的忽略文件：%s" % ignored_error.decode("utf-8", errors="replace").strip())
+            else:
+                for path in _parse_nul_paths(ignored_paths):
+                    if not (_is_secret_filename(path) and not os.path.isdir(os.path.join(target_path, path))):
+                        reasons.append("存在本机 Git 忽略文件：%s" % path)
+
+            staging = payload_manifest.get("_stagingDir")
+            if incoming_has_commits and staging:
+                rc_refs, ref_error = _fetch_bundle_refs(
+                    target_path, os.path.join(staging, "repo.bundle"), payload_manifest.get("refs") or {}, dry_run=True,
+                )
+                if rc_refs != 0:
+                    reasons.append("交接包的 Git 分支或标签与本机冲突：%s" % ref_error)
 
             rc_st, raw_st, err_st = _run_git_bytes(
                 target_path,
@@ -1849,8 +1911,6 @@ def apply_verified_payload(staging_dir: str, target_path: str) -> Dict[str, Any]
     os.makedirs(target_path, exist_ok=True)
 
     if mode == "git":
-        _clean_worktree_preserving_secrets(target_path, keep_dot_git=True)
-
         if not _is_git_repo_root(target_path):
             branch_init = manifest.get("branch") or "main"
             rc_init, _, err_init = _run_git_text(target_path, ["init", "-b", branch_init])
@@ -1874,18 +1934,11 @@ def apply_verified_payload(staging_dir: str, target_path: str) -> Dict[str, Any]
                 raise PackageError("暂存目录缺少 repo.bundle。")
 
             refs = manifest.get("refs") or {}
-            refspecs: List[str] = []
-            if any(k.startswith("refs/heads/") for k in refs):
-                refspecs.append("+refs/heads/*:refs/heads/*")
-            if any(k.startswith("refs/tags/") for k in refs):
-                refspecs.append("+refs/tags/*:refs/tags/*")
-            if refspecs:
-                rc_f, _, err_f = _run_git_text(
-                    target_path,
-                    ["fetch", "--update-head-ok", "-q", bundle_path] + refspecs,
-                )
-                if rc_f != 0:
-                    raise PackageError("从 Git bundle 导入分支失败：%s" % err_f.strip())
+            if branch and refs.get("refs/heads/" + branch) != head_commit:
+                raise PackageError("交接包的 Git 分支与声明的 HEAD 不一致：%s" % branch)
+            rc_f, err_f = _fetch_bundle_refs(target_path, bundle_path, refs)
+            if rc_f != 0:
+                raise PackageError("从 Git bundle 导入分支或标签失败：%s" % err_f)
 
             # Always ensure headCommit is unpacked even if HEAD was detached and not on any branch
             rc_cat, _, _ = _run_git_text(target_path, ["cat-file", "-e", "%s^{commit}" % head_commit])
@@ -1894,6 +1947,7 @@ def apply_verified_payload(staging_dir: str, target_path: str) -> Dict[str, Any]
                 if rc_fh != 0:
                     raise PackageError("从 Git bundle 导入 HEAD 失败：%s" % err_fh.strip())
 
+            _clean_worktree_preserving_secrets(target_path, keep_dot_git=True)
             if branch:
                 rc_co, _, err_co = _run_git_text(
                     target_path,
@@ -1912,6 +1966,7 @@ def apply_verified_payload(staging_dir: str, target_path: str) -> Dict[str, Any]
                 raise PackageError("重置目标仓库提交状态失败：%s" % err_rst.strip())
         else:
             # 0-commit unborn Git repository
+            _clean_worktree_preserving_secrets(target_path, keep_dot_git=True)
             unborn_branch = branch or "main"
             _run_git_text(target_path, ["symbolic-ref", "HEAD", "refs/heads/%s" % unborn_branch])
             _run_git_text(target_path, ["rm", "-rf", "--cached", "--ignore-unmatch", "."])
