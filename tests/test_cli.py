@@ -577,7 +577,7 @@ class TestExportImport(CliBase):
     def test_export_stdout_and_file(self):
         self.add()
         data = json.loads(self.ok("export"))
-        self.assertEqual((data["app"], data["version"]), ("relaydesk", 1))
+        self.assertEqual((data["app"], data["version"]), ("relaydesk", L.VERSION))
         self.assertIn("exportedAt", data)
         self.assertEqual(data["projects"][0]["id"], "animal-sim")
         self.assertIn("devices", data["config"])
@@ -819,6 +819,66 @@ class TestServe(CliBase):
         self.assertIn("relaydesk.server", err)
 
 
+class TestMultiDeviceManualAndInitCli(CliBase):
+    def test_init_custom_alias_device_json_and_rotate_keys(self):
+        target = self.dir / "custom_led.json"
+        with mock.patch.dict(os.environ):
+            del os.environ["RELAY_DESK_LEDGER"]
+            del os.environ["RELAY_DESK_DEVICE"]
+            with mock.patch.object(L, "hostname", return_value="STUDIO-MAC"):
+                out = self.ok("init", "--device", "mac-studio", "--name", "Mac Studio", "--ledger", target, "--host")
+            self.assertIn("mac-studio", out)
+            cfg = json.loads((self.dir / "home" / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(cfg["device"], "mac-studio")
+            devs = L.load(target)["config"]["devices"]
+            self.assertEqual([d["id"] for d in devs], ["mac-studio"])
+            self.assertEqual((devs[0]["name"], devs[0]["host"]), ("Mac Studio", "STUDIO-MAC"))
+
+            from relaydesk import crypto
+
+            ident_before = crypto.ensure_identity(self.dir / "home", alias="mac-studio", name="Mac Studio", os_name="mac", host="STUDIO-MAC")
+            dev_info = json.loads(self.ok("device", "--json"))
+            self.assertEqual(dev_info["here"], "mac-studio")
+            self.assertEqual(dev_info["deviceId"], ident_before["deviceId"])
+            self.assertEqual(len(dev_info["devices"]), 1)
+            self.assertEqual(dev_info["devices"][0]["status"], "self")
+
+            rot_out = self.ok("device", "--rotate-keys")
+            self.assertIn("已轮换本机密钥", rot_out)
+            self.assertIn(ident_before["deviceId"], rot_out)
+            dev_after = json.loads(self.ok("device", "--json"))
+            self.assertEqual(dev_after["deviceId"], ident_before["deviceId"])
+            self.assertNotEqual(dev_after["keyFingerprint"], ident_before["keyFingerprint"])
+            self.assertIn(dev_after["keyFingerprint"], rot_out)
+            led_dev = L.load(target)["config"]["devices"][0]
+            self.assertEqual(led_dev["deviceId"], ident_before["deviceId"])
+            self.assertEqual(led_dev["keyFingerprint"], dev_after["keyFingerprint"])
+            self.assertTrue(led_dev.get("rotatedAt"))
+
+    def test_set_path_other_for_device_and_handoff_to_gamma(self):
+        self.add()
+        self.ok("device", "--add", "gamma", "--name", "Gamma Box", "--os", "mac")
+        # Without --for-device when >1 other devices exist -> rejected
+        code, _, err = self.run_cli("set", "animal-sim", "--path-other", "/Users/gamma/animal")
+        self.assertEqual(code, 1)
+        self.assertIn("--for-device", err)
+
+        out = self.ok("set", "animal-sim", "--path-other", "/Users/gamma/animal", "--for-device", "gamma")
+        self.assertIn("gamma", out)
+        self.assertEqual(self.proj_of()["paths"]["gamma"], "/Users/gamma/animal")
+
+        # Manual handoff without --to when >1 other devices exist -> ambiguous
+        code, _, err_h = self.run_cli("handoff", "animal-sim")
+        self.assertEqual(code, 1)
+        self.assertIn("b", err_h)
+        self.assertIn("gamma", err_h)
+
+        out_h = self.ok("handoff", "animal-sim", "--to", "gamma")
+        self.assertIn("Gamma Box", out_h)
+        ho = self.proj_of()["handoff"]
+        self.assertEqual((ho["from"], ho["to"]), ("a", "gamma"))
+
+
 class TestCloudRelayCli(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -833,10 +893,15 @@ class TestCloudRelayCli(unittest.TestCase):
         self.uhome_b = self.root / "uhome_b"
         self.led_b = self.root / "led_b.json"
 
-    def _run_as(self, dev, *argv):
-        home = self.home_a if dev == "a" else self.home_b
-        uhome = self.uhome_a if dev == "a" else self.uhome_b
-        led = self.led_a if dev == "a" else self.led_b
+    def _dev_paths(self, dev):
+        if dev == "a":
+            return self.home_a, self.uhome_a, self.led_a
+        if dev == "b":
+            return self.home_b, self.uhome_b, self.led_b
+        return self.root / ("home_" + dev), self.root / ("uhome_" + dev), self.root / ("led_" + dev + ".json")
+
+    def _run_as(self, dev, *argv, extra_env=None):
+        home, uhome, led = self._dev_paths(dev)
         env = {k: v for k, v in os.environ.items() if not k.startswith("RELAY_DESK_")}
         env.update(
             {
@@ -846,6 +911,8 @@ class TestCloudRelayCli(unittest.TestCase):
                 "RELAY_DESK_USER_HOME": str(uhome),
             }
         )
+        if extra_env:
+            env.update(extra_env)
         o, e = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, env, clear=True):
             with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
@@ -978,6 +1045,331 @@ class TestCloudRelayCli(unittest.TestCase):
         send2_data = json.loads(out_send_js)
         self.assertEqual(send2_data["message"], "已交棒，可以关机")
         self.assertEqual(send2_data["parentRelayId"], rid)
+
+    def test_three_device_pair_publish_sync_send_receive_recover_cli_workflow(self):
+        for dev, name in (("a", "Alpha"), ("b", "Beta"), ("gamma", "Gamma")):
+            code, _, err = self._run_as(dev, "init", "--device", dev, "--name", name)
+            self.assertEqual(code, 0, err)
+            code, _, err = self._run_as(dev, "pair", "--provider", "local", "--root", self.cloud)
+            self.assertEqual(code, 0, err)
+
+        # Pair all 3 devices via --with ... --status and --with ... --accept --fingerprint FP
+        for me in ("a", "b", "gamma"):
+            for peer in ("a", "b", "gamma"):
+                if me == peer:
+                    continue
+                code, out_st, err_st = self._run_as(me, "pair", "--with", peer, "--status", "--json")
+                self.assertEqual(code, 0, (me, peer, err_st))
+                st_js = json.loads(out_st)
+                fp = st_js["pairFingerprint"]
+                self.assertTrue(fp)
+                code, out_acc, err_acc = self._run_as(
+                    me, "pair", "--with", peer, "--accept", "--fingerprint", fp, "--json"
+                )
+                self.assertEqual(code, 0, (me, peer, err_acc))
+                acc_js = json.loads(out_acc)
+                self.assertTrue(acc_js["paired"])
+
+        code, out_devs, err_devs = self._run_as("a", "device", "--json")
+        self.assertEqual(code, 0, err_devs)
+        devs_js = json.loads(out_devs)
+        paired_aliases = {d["alias"] for d in devs_js["devices"] if d.get("paired") and not d.get("isHere")}
+        self.assertEqual(paired_aliases, {"b", "gamma"})
+
+        # Create project & Claude session on A
+        proj_a = self.root / "multi_proj_a"
+        proj_a.mkdir()
+        (proj_a / "app.py").write_text("print('v1')\n", encoding="utf-8")
+        (proj_a / "HANDOFF.md").write_text("## Multi Handoff\n", encoding="utf-8")
+        self._run_as("a", "add", "Multi App", "--path", proj_a, "--id", "multi-app")
+        self._run_as("a", "note", "multi-app", "--last", "初始化三机项目", "--next", "发布快照")
+
+        from relaydesk import scan
+
+        cdir = self.uhome_a / ".claude" / "projects" / scan.enc_path(str(proj_a))
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "sess_m1.jsonl").write_text(
+            json.dumps({"type": "user", "message": {"role": "user", "content": "MULTI_SYNC_TOKEN"}}, ensure_ascii=False)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        # Publish on A: keeps device == 'a', pushes snapshot to b and gamma
+        code, out_pub, err_pub = self._run_as("a", "publish", "multi-app", "--json")
+        self.assertEqual(code, 0, err_pub)
+        pub_js = json.loads(out_pub)
+        self.assertTrue(pub_js["ok"])
+        self.assertEqual(pub_js["device"], "a")
+        self.assertEqual({d["alias"] for d in pub_js["deliveredTo"]}, {"b", "gamma"})
+        self.assertEqual(L.load(self.led_a)["projects"][0]["device"], "a")
+
+        # Sync on B (text mode)
+        code, out_sync_b, err_sync_b = self._run_as("b", "sync")
+        self.assertEqual(code, 0, err_sync_b)
+        self.assertIn("网络同步完成", out_sync_b)
+        self.assertIn("同步快照：1 个", out_sync_b)
+
+        # Sync with --watch --max-cycles 1 on gamma (--json)
+        code, out_sync_g, err_sync_g = self._run_as(
+            "gamma", "sync", "--watch", "--max-cycles", "1", "--interval", "0.01", "--json"
+        )
+        self.assertEqual(code, 0, err_sync_g)
+        sync_g_js = json.loads(out_sync_g)
+        self.assertTrue(sync_g_js["ok"])
+        self.assertEqual(sync_g_js["cycles"], 1)
+        self.assertGreaterEqual(len(sync_g_js["syncedSnapshots"]), 1)
+        self.assertEqual(sync_g_js["syncedSnapshots"][0]["snapshotId"], pub_js["snapshotId"])
+
+        # Send without --to when 2 peers are paired -> error listing candidates
+        code, _, err_amb = self._run_as("a", "send", "multi-app")
+        self.assertEqual(code, 1)
+        self.assertIn("候选设备", err_amb)
+        self.assertIn("b", err_amb)
+        self.assertIn("gamma", err_amb)
+
+        # Send explicitly to gamma
+        code, out_send_g, err_send_g = self._run_as("a", "send", "multi-app", "--to", "gamma")
+        self.assertEqual(code, 0, err_send_g)
+        self.assertIn("已交棒，可以关机", out_send_g)
+
+        # B is not authorized receiver -> inbox empty
+        code, out_ib_b, _ = self._run_as("b", "inbox", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out_ib_b)["incoming"], [])
+
+        # Gamma sees 1 incoming relay and receives it
+        code, out_ib_g, _ = self._run_as("gamma", "inbox", "--json")
+        self.assertEqual(code, 0)
+        rid1 = json.loads(out_ib_g)["incoming"][0]["relayId"]
+        proj_gamma = self.root / "multi_proj_gamma"
+        code, out_recv_g, err_recv_g = self._run_as("gamma", "receive", rid1, "--path", proj_gamma)
+        self.assertEqual(code, 0, err_recv_g)
+        self.assertIn("接棒完成", out_recv_g)
+        self.assertEqual((proj_gamma / "app.py").read_text(encoding="utf-8"), "print('v1')\n")
+
+        # Send back from gamma -> a, inject fault on receive at A, inspect & rollback via recover
+        (proj_gamma / "app.py").write_text("print('v2_from_gamma')\n", encoding="utf-8")
+        code, out_s2, err_s2 = self._run_as("gamma", "send", "multi-app", "--to", "a", "--json")
+        self.assertEqual(code, 0, err_s2)
+        rid2 = json.loads(out_s2)["relayId"]
+
+        with self.assertRaises(RuntimeError):
+            self._run_as(
+                "a",
+                "receive",
+                rid2,
+                extra_env={"RELAY_DESK_FAULT_POINT": "tx_after_workspace_commit"},
+            )
+        # Workspace had v2 applied before crash; inspect and rollback via `recover`
+        self.assertEqual((proj_a / "app.py").read_text(encoding="utf-8"), "print('v2_from_gamma')\n")
+
+        code, out_rec_st, err_rec_st = self._run_as("a", "recover", rid2, "--status")
+        self.assertEqual(code, 0, err_rec_st)
+        self.assertIn("恢复事务", out_rec_st)
+        self.assertIn("可回滚：是", out_rec_st)
+
+        code, out_rec_rb, err_rec_rb = self._run_as("a", "recover", rid2, "--rollback")
+        self.assertEqual(code, 0, err_rec_rb)
+        self.assertIn("已回滚事务", out_rec_rb)
+        self.assertEqual((proj_a / "app.py").read_text(encoding="utf-8"), "print('v1')\n")
+
+        code, out_rec_js, _ = self._run_as("a", "recover", rid2, "--status", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out_rec_js)["state"], "rolled_back")
+
+
+class TestDoctorAndCacheCliPhaseD(CliBase):
+    """Parser and exit-code contract of the Phase D commands on a home that never paired."""
+
+    def test_parsers_and_fresh_home(self):
+        self.ok("init", "--device", "a")
+        rc, out, err = self.run_cli("cache")
+        self.assertEqual(rc, 1)
+        self.assertIn("用法错误", err)
+        rc, out, err = self.run_cli("cache", "prune", "--dry-run", "--apply")
+        self.assertEqual(rc, 1)
+        rc, out, err = self.run_cli("doctor", "--json")
+        rep = json.loads(out)
+        self.assertEqual(rc, 3)  # warnings only: cloud relay not configured yet
+        self.assertEqual([f["code"] for f in rep["findings"]], ["cloud_not_configured"])
+        self.assertEqual(rep["findings"][0]["command"], "relay pair --remote <rclone 连接名> --root <云端目录>")
+        rc, out, err = self.run_cli("doctor")
+        self.assertIn("处理命令：relay pair --remote <rclone 连接名> --root <云端目录>", out)
+        rc, out, err = self.run_cli("cache", "status", "--json")
+        self.assertEqual(rc, 0, err)
+        st = json.loads(out)
+        self.assertEqual((st["payloads"]["count"], st["checkpoints"]["count"], st["recovery"]["count"]), (0, 0, 0))
+        rc, out, err = self.run_cli("cache", "prune", "--json")
+        self.assertEqual(rc, 3)  # nothing to prune before the first sync: blocked with a warning, nothing written
+        self.assertEqual(json.loads(out)["blocked"][0]["code"], "delivery_state_missing")
+        rc, out, err = self.run_cli("doctor", "nope", "--json")
+        self.assertEqual((rc, json.loads(out)["code"]), (1, "project_not_found"))
+        self.assertIn("--reissue", self.run_cli("send", "--help")[1])
+
+    def test_doctor_reports_a_damaged_config_without_writing(self):
+        self.ok("init", "--device", "a")
+        cfg = Path(os.environ["RELAY_DESK_HOME"]) / "config.json"
+        cfg.write_text("{broken", encoding="utf-8")
+        before = cfg.read_bytes()
+        rc, out, err = self.run_cli("doctor", "--json")
+        self.assertEqual(rc, 4)
+        rep = json.loads(out)
+        self.assertEqual(rep["findings"][0]["code"], "config_corrupted")
+        self.assertEqual(rep["findings"][0]["command"], 'cp "<config.json 的备份>" "%s"' % cfg)
+        self.assertEqual(cfg.read_bytes(), before)
+
+
+class TestSyncCliPhaseB(unittest.TestCase):
+    """`relay sync`: --jsonl streaming, --json/--jsonl exclusivity, exit codes 0/3/4/130, text output."""
+
+    setUp = TestCloudRelayCli.setUp
+    _dev_paths = TestCloudRelayCli._dev_paths
+    _run_as = TestCloudRelayCli._run_as
+
+    def pair_two(self):
+        for dev, name in (("a", "Alpha"), ("b", "Beta")):
+            code, _, err = self._run_as(dev, "init", "--device", dev, "--name", name)
+            self.assertEqual(code, 0, err)
+            code, _, err = self._run_as(dev, "pair", "--provider", "local", "--root", self.cloud)
+            self.assertEqual(code, 0, err)
+        for me, peer in (("a", "b"), ("b", "a")):
+            code, out_st, err = self._run_as(me, "pair", "--with", peer, "--status", "--json")
+            self.assertEqual(code, 0, err)
+            fp = json.loads(out_st)["pairFingerprint"]
+            code, _, err = self._run_as(me, "pair", "--with", peer, "--accept", "--fingerprint", fp, "--json")
+            self.assertEqual(code, 0, err)
+        proj = self.root / "proj_a"
+        proj.mkdir()
+        (proj / "app.py").write_text("print('v1')\n", encoding="utf-8")
+        self._run_as("a", "add", "Sync App", "--path", proj, "--id", "sync-app")
+        code, out_pub, err = self._run_as("a", "publish", "sync-app", "--json")
+        self.assertEqual(code, 0, err)
+        return json.loads(out_pub)
+
+    def test_json_and_jsonl_are_mutually_exclusive(self):
+        code, _, err = self._run_as("a", "sync", "--json", "--jsonl")
+        self.assertEqual(code, 1)
+        self.assertIn("not allowed", err)
+        code, _, err = self._run_as("a", "sync", "--interval", "10", "--max-backoff", "5")
+        self.assertEqual(code, 1)
+        self.assertIn("--max-backoff", err)
+
+    def test_jsonl_streams_events_and_ends_with_summary(self):
+        pub = self.pair_two()
+        code, out, err = self._run_as("b", "sync", "--jsonl")
+        self.assertEqual(code, 0, err)
+        lines = [json.loads(line) for line in out.splitlines() if line.strip()]
+        kinds = [e["kind"] for e in lines]
+        self.assertEqual(kinds[0], "run_started")
+        self.assertEqual(kinds[-1], "summary")
+        self.assertIn("snapshot_cached", kinds)
+        self.assertEqual([e["seq"] for e in lines], list(range(1, len(lines) + 1)))
+        summary = lines[-1]["summary"]
+        self.assertEqual(summary["status"], "success")
+        self.assertEqual(summary["syncedSnapshots"][0]["snapshotId"], pub["snapshotId"])
+        self.assertNotIn("recentEvents", summary)
+        # watch + jsonl streams every round
+        code, out, err = self._run_as("b", "sync", "--watch", "--max-cycles", "3", "--interval", "0.01", "--jsonl")
+        self.assertEqual(code, 0, err)
+        lines = [json.loads(line) for line in out.splitlines() if line.strip()]
+        self.assertEqual(sum(1 for e in lines if e["kind"] == "round_finished"), 3)
+        self.assertEqual(lines[-1]["summary"]["cycles"], 3)
+
+    def test_text_output_keeps_legacy_lines_and_adds_status(self):
+        self.pair_two()
+        code, out, err = self._run_as("b", "sync")
+        self.assertEqual(code, 0, err)
+        self.assertIn("网络同步完成（共 1 轮）", out)
+        self.assertIn("同步快照：1 个", out)
+        self.assertIn("同步状态：成功", out)
+        code, out, err = self._run_as("b", "sync", "--watch", "--max-cycles", "2", "--interval", "0.01")
+        self.assertEqual(code, 0, err)
+        self.assertIn("持续同步已启动", out)
+        self.assertIn("持续同步已停止（成功）：共 2 轮", out)
+
+    def test_exit_code_partial_when_busy(self):
+        self.pair_two()
+        from relaydesk import relay_engine
+
+        with relay_engine._workspace_operation(self.home_b):
+            code, out, err = self._run_as("b", "sync", "--json")
+        self.assertEqual(code, 3, err)
+        res = json.loads(out)
+        self.assertEqual(res["status"], "partial")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["unresolved"][0]["errorClass"], "local_busy")
+        with relay_engine._workspace_operation(self.home_b):
+            pass
+
+    def test_exit_code_needs_action(self):
+        # before the first round: not configured -> machine-readable error, exit 4
+        code, _, err = self._run_as("a", "init", "--device", "a", "--name", "Alpha")
+        self.assertEqual(code, 0, err)
+        code, out, err = self._run_as("a", "sync", "--json")
+        self.assertEqual(code, 4)
+        body = json.loads(out)
+        self.assertEqual((body["ok"], body["status"], body["code"], body["errorClass"]),
+                         (False, "needs_action", "not_configured", "needs_user_action"))
+        self.assertIn("relay pair", err)
+        code, out, err = self._run_as("a", "sync", "--jsonl")
+        self.assertEqual(code, 4)
+        self.assertEqual(json.loads(out.splitlines()[-1])["kind"], "error")
+
+    def test_exit_code_needs_action_for_key_changed_peer(self):
+        self.pair_two()
+        cloud_path = self.home_b / "cloud.json"
+        cloud = json.loads(cloud_path.read_text(encoding="utf-8"))
+        for peer in cloud["peers"].values():
+            peer["status"], peer["paired"] = "key_changed", False
+        cloud_path.write_text(json.dumps(cloud), encoding="utf-8")
+        code, out, err = self._run_as("b", "sync")
+        self.assertEqual(code, 4, out + err)
+        self.assertIn("同步状态：需要处理", out)
+        self.assertIn("relay pair --with", err)
+
+    def test_exit_code_cancelled_prints_summary_and_releases_lock(self):
+        self.pair_two()
+        from relaydesk import relay_engine
+        from relaydesk import sync_runtime
+
+        with mock.patch.object(sync_runtime.RealClock, "sleep", side_effect=KeyboardInterrupt):
+            code, out, err = self._run_as("b", "sync", "--watch", "--interval", "0.01", "--json")
+        self.assertEqual(code, 130, err)
+        res = json.loads(out)
+        self.assertEqual(res["status"], "cancelled")
+        self.assertEqual(res["cycles"], 1)
+        with relay_engine._workspace_operation(self.home_b):
+            pass
+        with mock.patch.object(sync_runtime.RealClock, "sleep", side_effect=KeyboardInterrupt):
+            code, out, err = self._run_as("b", "sync", "--watch", "--interval", "0.01")
+        self.assertEqual(code, 130)
+        self.assertIn("持续同步已停止（已取消）：共 1 轮", out)
+
+    def test_publish_reports_failed_peer_without_aborting(self):
+        for dev, name in (("a", "Alpha"), ("b", "Beta")):
+            self._run_as(dev, "init", "--device", dev, "--name", name)
+            self._run_as(dev, "pair", "--provider", "local", "--root", self.cloud)
+        for me, peer in (("a", "b"), ("b", "a")):
+            _, out_st, _ = self._run_as(me, "pair", "--with", peer, "--status", "--json")
+            self._run_as(me, "pair", "--with", peer, "--accept", "--fingerprint", json.loads(out_st)["pairFingerprint"])
+        proj = self.root / "proj_a"
+        proj.mkdir()
+        (proj / "app.py").write_text("print('v1')\n", encoding="utf-8")
+        self._run_as("a", "add", "Sync App", "--path", proj, "--id", "sync-app")
+        from relaydesk import storage
+
+        original = storage.LocalDirProvider.upload
+
+        def upload(provider, local_path, key):
+            if key.startswith("v3/inbox/"):
+                raise storage.StorageError("injected")
+            return original(provider, local_path, key)
+
+        with mock.patch.object(storage.LocalDirProvider, "upload", upload):
+            code, out, err = self._run_as("a", "publish", "sync-app")
+        self.assertEqual(code, 0, err)
+        self.assertIn("推送失败", err)
+        self.assertIn("relay sync", err)
 
 
 if __name__ == "__main__":

@@ -516,10 +516,11 @@ class TestTrueTimeShiftedAsyncRelay(E2EBase):
             self.assertTrue(relay_id_1, "Expected relayId recorded in A's ledger: %r" % proj_a)
 
             # Verify cloud storage contains encrypted objects only (no plaintext leaks)
-            raw_ready_1 = cloud_env.read_object("relays/%s/ready.json" % relay_id_1).decode("utf-8")
+            dev_b_did = dev_b.ok_json("device")["deviceId"]
+            raw_ready_1 = cloud_env.read_object("v3/inbox/%s/%s/ready.json" % (dev_b_did, relay_id_1)).decode("utf-8")
             self.assertNotIn("完成 A 机流式加密与工作区快照", raw_ready_1)
             self.assertNotIn("SUPER_SECRET_KEY_A", raw_ready_1)
-            raw_pkg_1 = cloud_env.read_object("relays/%s/package.enc" % relay_id_1)
+            raw_pkg_1 = cloud_env.read_object("v3/inbox/%s/%s/package.enc" % (dev_b_did, relay_id_1))
             self.assertNotIn(b"SUPER_SECRET_KEY_A", raw_pkg_1)
             self.assertNotIn(b"CLAUDE_TOKEN_ALPHA_101", raw_pkg_1)
 
@@ -1073,10 +1074,13 @@ class TestFaultRecoveryAndSecurityGates(E2EBase):
         code_2, _, err_2 = dev_a.run_cli("send", "sec-pk")
         self.assertNotEqual(code_2, 0, "Private key in Git commit history must be rejected before upload!")
         self.assertEqual(dev_b.ok_json("inbox").get("incoming"), [])
-        # Ensure nothing was uploaded under `relays/`
+        # Ensure nothing was uploaded under `relays/` or `v3/inbox/`
         relays_dir = cenv.storage_root_dir / "relays"
         if relays_dir.exists():
             self.assertEqual(list(relays_dir.rglob("ready.json")), [])
+        v3_inbox_dir = cenv.storage_root_dir / "v3" / "inbox"
+        if v3_inbox_dir.exists():
+            self.assertEqual(list(v3_inbox_dir.rglob("ready.json")), [])
 
     def test_interrupted_upload_invisible_in_inbox_and_reuses_same_relay_id(self) -> None:
         from relaydesk import storage
@@ -1100,7 +1104,7 @@ class TestFaultRecoveryAndSecurityGates(E2EBase):
             self.assertNotEqual(code_fail, 0)
 
         # `package.enc` was uploaded, `ready.json` was NOT -> B's inbox MUST see 0 claimable packages!
-        enc_files = list((cenv.storage_root_dir / "relays").rglob("package.enc"))
+        enc_files = list((cenv.storage_root_dir / "v3" / "inbox").rglob("package.enc"))
         self.assertEqual(len(enc_files), 1)
         interrupted_relay_id = enc_files[0].parent.name
         self.assertFalse((enc_files[0].parent / "ready.json").exists())
@@ -1146,8 +1150,9 @@ class TestFaultRecoveryAndSecurityGates(E2EBase):
         dev_a.ok("send", "tamper-proj")
         rid = dev_a.load_ledger()["projects"][0]["lastRelayId"]
 
-        enc_key = "relays/%s/package.enc" % rid
-        ready_key = "relays/%s/ready.json" % rid
+        dev_b_did = dev_b.ok_json("device")["deviceId"]
+        enc_key = "v3/inbox/%s/%s/package.enc" % (dev_b_did, rid)
+        ready_key = "v3/inbox/%s/%s/ready.json" % (dev_b_did, rid)
         orig_enc = cenv.read_object(enc_key)
         orig_ready = cenv.read_object(ready_key)
         self.assertGreater(len(orig_enc), 130000)
@@ -1257,8 +1262,10 @@ class TestFaultRecoveryAndSecurityGates(E2EBase):
             self.assertNotEqual(code_ack_fail, 0)
 
         # Local apply MUST already be complete on B, even though receipt.json is missing on cloud!
+        dev_b_did = dev_b.ok_json("device")["deviceId"]
+        receipt_key = "v3/inbox/%s/%s/receipt.json" % (dev_b_did, rid)
         self.assertEqual((repo_b / "README.md").read_text(encoding="utf-8"), "applied from A\n")
-        self.assertFalse(cenv.object_path("relays/%s/receipt.json" % rid).exists())
+        self.assertFalse(cenv.object_path(receipt_key).exists())
 
         # User immediately starts editing `repo_b` before retrying `relay receive <rid>`!
         write_text(repo_b / "README.md", "edited on B right after apply!\n")
@@ -1266,7 +1273,7 @@ class TestFaultRecoveryAndSecurityGates(E2EBase):
 
         # Re-running `relay receive <rid>` MUST only upload the saved receipt WITHOUT overwriting `repo_b` or complaining about dirty worktree!
         dev_b.ok("receive", rid)
-        self.assertTrue(cenv.object_path("relays/%s/receipt.json" % rid).is_file())
+        self.assertTrue(cenv.object_path(receipt_key).is_file())
         self.assertEqual((repo_b / "README.md").read_text(encoding="utf-8"), "edited on B right after apply!\n")
         self.assertEqual((repo_b / "new_b_work.py").read_text(encoding="utf-8"), "WORK = 42\n")
 
@@ -1360,6 +1367,10 @@ class TestWebWorkbenchCloudApiE2E(E2EBase):
             )
             self.assertEqual(st_pb1, 200, pb1)
             self.assertTrue(pb1.get("pairFingerprint"))
+
+            st_a1, status_a1 = self._http_req(dev_a, "GET", "/api/cloud/status")
+            self.assertEqual(st_a1, 200, status_a1)
+            self.assertEqual(status_a1.get("pairFingerprint"), pb1.get("pairFingerprint"))
 
             st_pa2, pa2 = self._http_req(dev_a, "POST", "/api/cloud/pair", {"accept": True})
             st_pb2, pb2 = self._http_req(dev_b, "POST", "/api/cloud/pair", {"accept": True})

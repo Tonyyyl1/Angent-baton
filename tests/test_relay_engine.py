@@ -224,16 +224,49 @@ class TestPairingAndStatus(RelayEngineTestBase):
             st_again = relay_engine.pair_device(accept=False)
             self.assertTrue(st_again["paired"])
 
-        # Rotate B's identity and republish -> A must drop paired=False until accept=True
-        os.unlink(str(self.home_b / "identity.json"))
+        # 1. Normal key rotation via rotate_identity_keys preserves deviceId, pauses B, and re-accepts cleanly
+        crypto.rotate_identity_keys(self.home_b)
         with self.env_b():
-            relay_engine.pair_device(accept=False)
+            st_b_rot = relay_engine.pair_device(accept=False)
+            self.assertEqual(st_b_rot["deviceId"], st_b["deviceId"])
         with self.env_a():
             st_rotated = relay_engine.pair_device(accept=False)
             self.assertFalse(st_rotated["paired"])
+            self.assertEqual(st_rotated["peer"]["status"], "key_changed")
             self.assertNotEqual(st_rotated["pairFingerprint"], st_a["pairFingerprint"])
-            st_reaccepted = relay_engine.pair_device(accept=True)
+            st_reaccepted = relay_engine.pair_device(
+                with_device=st_b["deviceId"],
+                accept=True,
+                fingerprint=st_rotated["pairFingerprint"],
+            )
             self.assertTrue(st_reaccepted["paired"])
+            self.assertEqual(st_reaccepted["peer"]["status"], "paired")
+
+        # 2. Lost identity.json generates a new deviceId, NEVER inherits trust by alias,
+        #    and raises PeerConflictError (alias_conflict) until explicitly replaced.
+        os.unlink(str(self.home_b / "identity.json"))
+        with self.env_b():
+            st_b_lost = relay_engine.pair_device(accept=False)
+            self.assertNotEqual(st_b_lost["deviceId"], st_b["deviceId"])
+        with self.env_a():
+            with self.assertRaises(relay_engine.PeerConflictError) as ctx_conf:
+                relay_engine.pair_device(accept=False)
+            self.assertEqual(ctx_conf.exception.code, "alias_conflict")
+
+            st_view = relay_engine.cloud_status()
+            conflict_peers = [p for p in st_view["peers"] if p["deviceId"] == st_b_lost["deviceId"]]
+            self.assertEqual(len(conflict_peers), 1)
+            self.assertEqual(conflict_peers[0]["status"], "conflict")
+            new_fp = conflict_peers[0]["pairFingerprint"]
+
+            st_replaced = relay_engine.pair_device(
+                with_device=st_b_lost["deviceId"],
+                replace_device=True,
+                accept=True,
+                fingerprint=new_fp,
+            )
+            self.assertTrue(st_replaced["paired"])
+            self.assertEqual(st_replaced["peer"]["deviceId"], st_b_lost["deviceId"])
 
 
 class TestFullRoundTripAndFaultRecovery(RelayEngineTestBase):
@@ -259,11 +292,7 @@ class TestFullRoundTripAndFaultRecovery(RelayEngineTestBase):
         local_notes = repo_b / "local-notes.txt"
         local_notes.write_text("only on B\n", encoding="utf-8")
         self.assertEqual(_git(repo_b, "status", "--porcelain"), "")
-        with self.env_b():
-            with self.assertRaisesRegex(packager.TargetDirtyError, "local-notes.txt"):
-                relay_engine.receive_relay(rid, target_path=str(repo_b))
-        self.assertEqual(local_notes.read_text(encoding="utf-8"), "only on B\n")
-        local_notes.unlink()
+        # v3 (SPEC 6): an ignored file no longer blocks receive; it must survive every refusal below.
 
         _git(repo_b, "checkout", "-b", "side")
         _git(repo_b, "commit", "--allow-empty", "-m", "only on B")
@@ -281,6 +310,7 @@ class TestFullRoundTripAndFaultRecovery(RelayEngineTestBase):
             other = self.root / "incoming"
             self.assertTrue(relay_engine.receive_relay(rid, into_path=str(other))["ok"])
             self.assertEqual(_git(repo_b, "rev-parse", "snapshot").strip(), local_commit)
+        self.assertEqual(local_notes.read_text(encoding="utf-8"), "only on B\n")
 
     def test_receive_fast_forwards_branch_and_keeps_local_only_refs(self):
         self.pair_both()
@@ -303,7 +333,7 @@ class TestFullRoundTripAndFaultRecovery(RelayEngineTestBase):
         self.assertEqual(_git(repo_b, "rev-parse", "local-tag").strip(), initial)
 
     def test_retry_after_ready_is_visible_recovers_the_original_package(self):
-        self.pair_both()
+        _, st_b = self.pair_both()
         repo_a = self.create_git_project_on_a()
         real_stat = storage.LocalDirProvider.stat
 
@@ -321,7 +351,7 @@ class TestFullRoundTripAndFaultRecovery(RelayEngineTestBase):
             [published] = relay_engine.list_inbox()["incoming"]
             rid = published["relayId"]
             relay_engine.receive_relay(rid, target_path=str(repo_b))
-        ready_dir = self.cloud_dir / "relays" / rid
+        ready_dir = self.cloud_dir / "v3" / "inbox" / st_b["deviceId"] / rid
         original_ciphertext = (ready_dir / "package.enc").read_bytes()
         original_ready = (ready_dir / "ready.json").read_bytes()
         (repo_a / "keep.txt").write_text("new local work\n", encoding="utf-8")
@@ -336,13 +366,13 @@ class TestFullRoundTripAndFaultRecovery(RelayEngineTestBase):
             self.assertEqual([r["relayId"] for r in relay_engine.list_inbox()["syncedReceipts"]], [rid])
 
     def test_receipt_must_match_the_published_package_digest(self):
-        self.pair_both()
+        _, st_b = self.pair_both()
         self.create_git_project_on_a()
         with self.env_a():
             rid = relay_engine.send_project("demo")["relayId"]
         with self.env_b():
             relay_engine.receive_relay(rid, target_path=str(self.root / "received"))
-        receipt_path = self.cloud_dir / "relays" / rid / "receipt.json"
+        receipt_path = self.cloud_dir / "v3" / "inbox" / st_b["deviceId"] / rid / "receipt.json"
         original_receipt = receipt_path.read_text(encoding="utf-8")
         identity = json.loads((self.home_b / "identity.json").read_text(encoding="utf-8"))
         receipt = crypto.verify_json(json.loads(original_receipt), identity["verifyPublicKey"])
@@ -369,7 +399,7 @@ class TestFullRoundTripAndFaultRecovery(RelayEngineTestBase):
         target = self.root / "destination"
 
         def apply_partway(_staging, workspace):
-            Path(workspace).mkdir()
+            Path(workspace).mkdir(exist_ok=True)
             (Path(workspace) / "partial.txt").write_text("partial", encoding="utf-8")
             raise OSError("workspace unavailable")
 
@@ -388,8 +418,15 @@ class TestFullRoundTripAndFaultRecovery(RelayEngineTestBase):
         with self.env_a():
             rid = relay_engine.send_project("demo")["relayId"]
         target = self.root / "destination"
+        real_replace = os.replace
+
+        def fail_target_replace(src, dst):
+            if os.path.realpath(str(dst)) == os.path.realpath(str(target)):
+                raise OSError("rename interrupted")
+            return real_replace(src, dst)
+
         with self.env_b():
-            with mock.patch.object(relay_engine.os, "rename", side_effect=OSError("rename interrupted")):
+            with mock.patch.object(os, "replace", side_effect=fail_target_replace):
                 with self.assertRaisesRegex(OSError, "rename interrupted"):
                     relay_engine.receive_relay(rid, target_path=str(target))
             self.assertFalse(target.exists())
@@ -397,7 +434,7 @@ class TestFullRoundTripAndFaultRecovery(RelayEngineTestBase):
             self.assertTrue((target / "README.md").is_file())
 
     def test_archive_write_failure_leaves_destination_untouched_and_retryable(self):
-        self.pair_both()
+        _, st_b = self.pair_both()
         folder = self.root / "source-folder"
         folder.mkdir()
         (folder / "notes.txt").write_text("handoff contents\n", encoding="utf-8")
@@ -412,9 +449,13 @@ class TestFullRoundTripAndFaultRecovery(RelayEngineTestBase):
             with mock.patch.object(conversations, "merge_and_save_archive", side_effect=OSError("archive unavailable")):
                 with self.assertRaisesRegex(OSError, "archive unavailable"):
                     relay_engine.receive_relay(rid, target_path=str(target))
-            self.assertFalse(target.exists())
             self.assertEqual(L.load(self.led_b)["projects"], [])
-            self.assertFalse((self.cloud_dir / "relays" / rid / "receipt.json").exists())
+            self.assertFalse((self.cloud_dir / "v3" / "inbox" / st_b["deviceId"] / rid / "receipt.json").exists())
+            st_rec = relay_engine.recover_relay(rid, action="status")
+            self.assertEqual(st_rec["phase"], "WORKSPACE_COMMITTED")
+            self.assertTrue(st_rec["canRollback"])
+            relay_engine.recover_relay(rid, action="rollback")
+            self.assertFalse(target.exists())
             self.assertTrue(relay_engine.receive_relay(rid, target_path=str(target))["ok"])
             self.assertEqual((target / "notes.txt").read_text(encoding="utf-8"), "handoff contents\n")
 
@@ -557,7 +598,7 @@ class TestFullRoundTripAndFaultRecovery(RelayEngineTestBase):
             self.assertEqual(sids, sorted(["claude_s1", uuid_cx, "anti_s1", "claude_b2"]))
 
     def test_upload_interruption_hides_partial_and_reuses_same_relay_id_on_retry(self):
-        self.pair_both()
+        _, st_b = self.pair_both()
         self.create_git_project_on_a()
 
         real_make = storage.make_provider
@@ -575,8 +616,9 @@ class TestFullRoundTripAndFaultRecovery(RelayEngineTestBase):
 
             pending_state = json.loads((self.home_a / "relay_state.json").read_text(encoding="utf-8"))
             pending_rid = pending_state["pendingSends"]["demo"]["relayId"]
-            self.assertTrue((self.cloud_dir / "relays" / pending_rid / "package.enc").is_file())
-            self.assertFalse((self.cloud_dir / "relays" / pending_rid / "ready.json").exists())
+            inbox_dir = self.cloud_dir / "v3" / "inbox" / st_b["deviceId"] / pending_rid
+            self.assertTrue((inbox_dir / "package.enc").is_file())
+            self.assertFalse((inbox_dir / "ready.json").exists())
 
         # B must see 0 claimable packages while ready.json is absent!
         with self.env_b():
@@ -630,13 +672,13 @@ class TestFullRoundTripAndFaultRecovery(RelayEngineTestBase):
         self.assertFalse((self.cloud_dir / "relays").exists())
 
     def test_tamper_detection_leaves_workspace_and_ledger_untouched(self):
-        self.pair_both()
+        _, st_b = self.pair_both()
         self.create_git_project_on_a()
         with self.env_a():
             sent = relay_engine.send_project("demo", to_alias="b")
         rid = sent["relayId"]
 
-        pkg_file = self.cloud_dir / "relays" / rid / "package.enc"
+        pkg_file = self.cloud_dir / "v3" / "inbox" / st_b["deviceId"] / rid / "package.enc"
         orig_bytes = pkg_file.read_bytes()
 
         # Flip one bit in package.enc

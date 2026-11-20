@@ -257,6 +257,13 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(st, 400)
         self.assertEqual(self.store.n, 1)
 
+    def test_sync_watch_requires_file_store(self):
+        st, _, d = self.jreq("POST", "/api/cloud/sync/watch", {})
+        self.assertEqual(st, 400)
+        self.assertEqual(d["code"], "watch_requires_file_store")
+        st, _, d = self.jreq("GET", "/api/cloud/sync/watch")
+        self.assertEqual((st, d["running"], d["events"]), (200, False, []))
+
     def test_binds_loopback_only(self):
         self.assertEqual(self.srv.server_address[0], "127.0.0.1")
 
@@ -281,45 +288,48 @@ class CloudServerApiTest(unittest.TestCase):
         with open(self.html, "w", encoding="utf-8") as f:
             f.write(self.PAGE)
 
-        self.home_a = self.root / "home_a"
-        self.uhome_a = self.root / "uhome_a"
-        self.led_a = self.root / "led_a.json"
-        self.home_b = self.root / "home_b"
-        self.uhome_b = self.root / "uhome_b"
-        self.led_b = self.root / "led_b.json"
+        self.devs = {}
+        for dev in ("a", "b", "c"):
+            home = self.root / ("home_" + dev)
+            uhome = self.root / ("uhome_" + dev)
+            led = self.root / ("led_" + dev + ".json")
+            home.mkdir(parents=True, exist_ok=True)
+            uhome.mkdir(parents=True, exist_ok=True)
+            (home / "config.json").write_text(json.dumps({"device": dev, "ledger": str(led)}), encoding="utf-8")
+            if dev in ("a", "b"):
+                L.update(led, lambda _l: None)
+            else:
+                def _init_c(l):
+                    l["config"]["devices"].append(
+                        {"id": "c", "name": "设备 C", "os": "linux", "drop": "", "host": "", "deviceId": ""}
+                    )
+                L.update(led, _init_c)
+            srv = server.make_server(self.html, cli._FileStore(led), 0)
+            port = srv.server_address[1]
+            th = threading.Thread(target=srv.serve_forever, daemon=True)
+            th.start()
+            self.addCleanup(srv.server_close)
+            self.addCleanup(srv.shutdown)
+            self.devs[dev] = {"home": home, "uhome": uhome, "led": led, "srv": srv, "port": port}
 
-        for d in (self.home_a, self.uhome_a, self.home_b, self.uhome_b):
-            d.mkdir(parents=True, exist_ok=True)
-        (self.home_a / "config.json").write_text(json.dumps({"device": "a", "ledger": str(self.led_a)}), encoding="utf-8")
-        (self.home_b / "config.json").write_text(json.dumps({"device": "b", "ledger": str(self.led_b)}), encoding="utf-8")
-        L.update(self.led_a, lambda _l: None)
-        L.update(self.led_b, lambda _l: None)
+        self.home_a = self.devs["a"]["home"]
+        self.uhome_a = self.devs["a"]["uhome"]
+        self.led_a = self.devs["a"]["led"]
+        self.home_b = self.devs["b"]["home"]
+        self.uhome_b = self.devs["b"]["uhome"]
+        self.led_b = self.devs["b"]["led"]
 
-        self.srv_a = server.make_server(self.html, cli._FileStore(self.led_a), 0)
-        self.port_a = self.srv_a.server_address[1]
-        self.th_a = threading.Thread(target=self.srv_a.serve_forever, daemon=True)
-        self.th_a.start()
-        self.addCleanup(self.srv_a.server_close)
-        self.addCleanup(self.srv_a.shutdown)
-
-        self.srv_b = server.make_server(self.html, cli._FileStore(self.led_b), 0)
-        self.port_b = self.srv_b.server_address[1]
-        self.th_b = threading.Thread(target=self.srv_b.serve_forever, daemon=True)
-        self.th_b.start()
-        self.addCleanup(self.srv_b.server_close)
-        self.addCleanup(self.srv_b.shutdown)
-
-    def _call(self, dev, method, path, body=None, headers=None):
-        port = self.port_a if dev == "a" else self.port_b
-        home = self.home_a if dev == "a" else self.home_b
-        uhome = self.uhome_a if dev == "a" else self.uhome_b
-        led = self.led_a if dev == "a" else self.led_b
+    def _call(self, dev, method, path, body=None, headers=None, extra_env=None):
+        info = self.devs[dev]
+        port = info["port"]
         env = {
-            "RELAY_DESK_HOME": str(home),
-            "RELAY_DESK_LEDGER": str(led),
+            "RELAY_DESK_HOME": str(info["home"]),
+            "RELAY_DESK_LEDGER": str(info["led"]),
             "RELAY_DESK_DEVICE": dev,
-            "RELAY_DESK_USER_HOME": str(uhome),
+            "RELAY_DESK_USER_HOME": str(info["uhome"]),
         }
+        if extra_env:
+            env.update(extra_env)
         h = {"Host": "127.0.0.1:%d" % port}
         if method != "GET":
             h["X-Relay-Desk"] = "1"
@@ -362,9 +372,18 @@ class CloudServerApiTest(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertFalse(pa1["paired"])
 
-        st, pb1 = self._call("b", "POST", "/api/cloud/pair", {"provider": "local", "root": str(self.cloud), "accept": True})
+        st, pb0 = self._call("b", "POST", "/api/cloud/pair", {"provider": "local", "root": str(self.cloud), "accept": False})
+        self.assertEqual(st, 200)
+        self.assertFalse(pb0["paired"])
+        self.assertTrue(pb0["pairFingerprint"])
+
+        st, pb1 = self._call("b", "POST", "/api/cloud/pair", {"accept": True, "fingerprint": pb0["pairFingerprint"]})
         self.assertEqual(st, 200)
         self.assertTrue(pb1["paired"])
+
+        st, pa_st = self._call("a", "GET", "/api/cloud/status")
+        self.assertEqual(st, 200)
+        self.assertTrue(pa_st["pairFingerprint"])
 
         st, pa2 = self._call("a", "POST", "/api/cloud/pair", {"accept": True})
         self.assertEqual(st, 200)
@@ -452,6 +471,354 @@ class CloudServerApiTest(unittest.TestCase):
         self.assertTrue(recv2["ok"])
         self.assertEqual((proj_a_into / "index.js").read_text(encoding="utf-8"), "console.log(2);\n")
         self.assertEqual((proj_a / "index.js").read_text(encoding="utf-8"), "console.log('dirty local A');\n")
+
+    def _pair_all_three(self):
+        for dev in ("a", "b", "c"):
+            st, _ = self._call(dev, "POST", "/api/cloud/pair", {"provider": "local", "root": str(self.cloud), "accept": False})
+            self.assertEqual(st, 200)
+        for me in ("a", "b", "c"):
+            for peer in ("a", "b", "c"):
+                if me == peer:
+                    continue
+                st, st_res = self._call(me, "GET", "/api/cloud/status?with=" + peer)
+                self.assertEqual(st, 200, (me, peer, st_res))
+                fp = st_res["pairFingerprint"]
+                self.assertTrue(fp)
+                st, acc_res = self._call(me, "POST", "/api/cloud/pair", {"accept": True, "with": peer, "fingerprint": fp})
+                self.assertEqual(st, 200, (me, peer, acc_res))
+                self.assertTrue(acc_res["paired"])
+
+    def test_multi_device_and_recovery_http_routes(self):
+        from relaydesk import ledger as L
+
+        self._pair_all_three()
+
+        # Guard checks: Host & CSRF X-Relay-Desk on all new routes
+        st_host, _ = self._call("a", "GET", "/api/devices", headers={"Host": "evil.example"})
+        self.assertEqual(st_host, 403)
+        st_host_rec, _ = self._call("a", "GET", "/api/cloud/recover?relayId=r_1", headers={"Host": "evil.example"})
+        self.assertEqual(st_host_rec, 403)
+        for route, body in (
+            ("/api/cloud/publish", {"project": "srv-multi"}),
+            ("/api/cloud/sync", {}),
+            ("/api/cloud/recover", {"relayId": "r_1", "action": "status"}),
+        ):
+            st_csrf, _ = self._call("a", "POST", route, body, headers={"X-Relay-Desk": None})
+            self.assertEqual(st_csrf, 403, route)
+            st_csrf2, _ = self._call("a", "POST", route, body, headers={"X-Relay-Desk": "0"})
+            self.assertEqual(st_csrf2, 403, route)
+            st_h, _ = self._call("a", "POST", route, body, headers={"Host": "evil.example"})
+            self.assertEqual(st_h, 403, route)
+
+        # GET /api/devices returns local + paired devices
+        st, devs = self._call("a", "GET", "/api/devices")
+        self.assertEqual(st, 200)
+        self.assertEqual(devs["here"], "a")
+        by_alias = {d["alias"]: d for d in devs["devices"]}
+        self.assertEqual(by_alias["a"]["status"], "self")
+        self.assertTrue(by_alias["b"]["paired"])
+        self.assertTrue(by_alias["c"]["paired"])
+
+        # Add project on A
+        proj_a = self.root / "srv_multi_a"
+        proj_a.mkdir()
+        (proj_a / "main.py").write_text("x = 1\n", encoding="utf-8")
+        L.update(
+            self.devs["a"]["led"],
+            lambda l: l["projects"].append(
+                L.norm_project(
+                    {
+                        "id": "srv-multi",
+                        "name": "多机服务项目",
+                        "device": "a",
+                        "paths": {"a": str(proj_a)},
+                    },
+                    l["config"],
+                )
+            ),
+        )
+
+        # POST /api/cloud/publish on A (keeps ownership on A, delivers to B and C)
+        st, pub = self._call("a", "POST", "/api/cloud/publish", {"project": "srv-multi"})
+        self.assertEqual(st, 200)
+        self.assertTrue(pub["ok"])
+        self.assertEqual(pub["device"], "a")
+        self.assertEqual({d["alias"] for d in pub["deliveredTo"]}, {"b", "c"})
+        self.assertEqual(L.load(self.devs["a"]["led"])["projects"][0]["device"], "a")
+
+        # POST /api/cloud/sync on B
+        st, sync_b = self._call("b", "POST", "/api/cloud/sync", {})
+        self.assertEqual(st, 200)
+        self.assertTrue(sync_b["ok"])
+        self.assertEqual(len(sync_b["syncedSnapshots"]), 1)
+        self.assertEqual(sync_b["syncedSnapshots"][0]["snapshotId"], pub["snapshotId"])
+
+        # POST /api/cloud/send without `to` when 2 peers paired -> 409 ambiguous_peer with candidates
+        st, err_amb = self._call("a", "POST", "/api/cloud/send", {"project": "srv-multi"})
+        self.assertEqual(st, 409)
+        self.assertEqual(err_amb["code"], "ambiguous_peer")
+        cand_aliases = {c["alias"] for c in err_amb["candidates"]}
+        self.assertEqual(cand_aliases, {"b", "c"})
+
+        # Send to C and receive cleanly into proj_c
+        st, send_c = self._call("a", "POST", "/api/cloud/send", {"project": "srv-multi", "to": "c"})
+        self.assertEqual(st, 200)
+        rid1 = send_c["relayId"]
+        proj_c = self.root / "srv_multi_c"
+        st, recv_c = self._call("c", "POST", "/api/cloud/receive", {"relayId": rid1, "path": str(proj_c)})
+        self.assertEqual(st, 200)
+        self.assertTrue(recv_c["ok"])
+        self.assertEqual((proj_c / "main.py").read_text(encoding="utf-8"), "x = 1\n")
+
+        # Send from C -> A, edit on A? No, send back A -> C after editing on C -> A -> C
+        (proj_c / "main.py").write_text("x = 2\n", encoding="utf-8")
+        st, send_a = self._call("c", "POST", "/api/cloud/send", {"project": "srv-multi", "to": "a"})
+        self.assertEqual(st, 200)
+        st, recv_a = self._call("a", "POST", "/api/cloud/receive", {"relayId": send_a["relayId"]})
+        self.assertEqual(st, 200)
+        (proj_a / "main.py").write_text("x = 3\n", encoding="utf-8")
+        st, send_c2 = self._call("a", "POST", "/api/cloud/send", {"project": "srv-multi", "to": "c"})
+        self.assertEqual(st, 200)
+        rid_tx = send_c2["relayId"]
+
+        # Inject fault during receive on C to leave transaction at WORKSPACE_COMMITTED
+        with self.mock.patch.object(server._Handler, "log_error", lambda *a, **k: None):
+            st_fault, _ = self._call(
+                "c",
+                "POST",
+                "/api/cloud/receive",
+                {"relayId": rid_tx},
+                extra_env={"RELAY_DESK_FAULT_POINT": "tx_after_workspace_commit"},
+            )
+        self.assertEqual(st_fault, 500)
+        self.assertEqual((proj_c / "main.py").read_text(encoding="utf-8"), "x = 3\n")
+
+        # GET /api/cloud/recover missing relayId -> 400; valid -> 200 status
+        st_bad_q, _ = self._call("c", "GET", "/api/cloud/recover")
+        self.assertEqual(st_bad_q, 400)
+        st_rec_get, rec_st = self._call("c", "GET", "/api/cloud/recover?relayId=" + rid_tx)
+        self.assertEqual(st_rec_get, 200)
+        self.assertTrue(rec_st["exists"])
+        self.assertEqual(rec_st["phase"], "WORKSPACE_COMMITTED")
+        self.assertTrue(rec_st["canRollback"])
+
+        # Simulate post-crash user modification in proj_c -> recovery_conflict (409)
+        (proj_c / "main.py").write_text("x = 999 # user edit\n", encoding="utf-8")
+        st_conf_st, conf_st = self._call("c", "POST", "/api/cloud/recover", {"relayId": rid_tx, "action": "status"})
+        self.assertEqual(st_conf_st, 200)
+        self.assertEqual(conf_st["state"], "workspace_committed")
+        self.assertFalse(conf_st["canRollback"])
+        self.assertTrue(conf_st["reasons"])
+
+        st_conf_409, conf_409 = self._call("c", "POST", "/api/cloud/recover", {"relayId": rid_tx, "action": "rollback"})
+        self.assertEqual(st_conf_409, 409)
+        self.assertEqual(conf_409["code"], "recovery_conflict")
+        self.assertEqual(conf_409["relayId"], rid_tx)
+        self.assertTrue(conf_409["targetPath"])
+        self.assertTrue(conf_409["reasons"])
+
+        # Revert post-crash edit back to post-tx content -> rollback succeeds and restores x = 2
+        (proj_c / "main.py").write_text("x = 3\n", encoding="utf-8")
+        st_rb, rb_res = self._call("c", "POST", "/api/cloud/recover", {"relayId": rid_tx, "action": "rollback"})
+        self.assertEqual(st_rb, 200)
+        self.assertEqual(rb_res["phase"], "ROLLED_BACK")
+        self.assertEqual((proj_c / "main.py").read_text(encoding="utf-8"), "x = 2\n")
+
+
+    # ---- Phase B: continuous sync worker
+    def _wait_watch(self, dev, pred, timeout=30.0):
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        seen = []
+        since = 0
+        while _time.monotonic() < deadline:
+            st, w = self._call(dev, "GET", "/api/cloud/sync/watch?since=%d" % since)
+            self.assertEqual(st, 200)
+            seen.extend(w["events"])
+            since = w["lastSeq"]
+            if pred(w, seen):
+                return w, seen
+            _time.sleep(0.1)
+        self.fail("watch condition not reached; events=%r" % [e["kind"] for e in seen])
+
+    def test_sync_watch_worker_routes(self):
+        from relaydesk import ledger as L
+        from relaydesk import relay_engine as E
+
+        self._pair_all_three()
+        proj_a = self.root / "watch_proj_a"
+        proj_a.mkdir()
+        (proj_a / "main.py").write_text("x = 1\n", encoding="utf-8")
+        L.update(self.devs["a"]["led"], lambda l: l["projects"].append(
+            L.norm_project({"id": "watch-demo", "name": "Watch", "device": "a", "paths": {"a": str(proj_a)}}, l["config"])))
+        st, pub = self._call("a", "POST", "/api/cloud/publish", {"project": "watch-demo"})
+        self.assertEqual(st, 200, pub)
+
+        st, w0 = self._call("b", "GET", "/api/cloud/sync/watch")
+        self.assertEqual((st, w0["running"]), (200, False))
+        st, bad = self._call("b", "POST", "/api/cloud/sync/watch", {"interval": 0.5})
+        self.assertEqual(st, 400)
+        st, started = self._call("b", "POST", "/api/cloud/sync/watch", {"interval": 2, "maxBackoff": 30})
+        self.assertEqual(st, 200, started)
+        self.assertTrue(started["running"])
+        run_id = started["runId"]
+        st, again = self._call("b", "POST", "/api/cloud/sync/watch", {"interval": 2, "maxBackoff": 30})
+        self.assertEqual((st, again["runId"]), (200, run_id))
+        st, other = self._call("b", "POST", "/api/cloud/sync/watch", {"interval": 3, "maxBackoff": 30})
+        self.assertEqual((st, other["code"]), (409, "watch_running"))
+        st, once = self._call("b", "POST", "/api/cloud/sync", {})
+        self.assertEqual((st, once["code"], once["errorClass"]), (409, "watch_running", "local_busy"))
+
+        w, seen = self._wait_watch("b", lambda w, seen: any(e["kind"] == "snapshot_cached" for e in seen))
+        self.assertEqual(seen[0]["kind"], "run_started")
+        self.assertEqual(seen[0]["seq"], 1)
+        self.assertEqual(w["gap"], 0)
+        cached = next(e for e in seen if e["kind"] == "snapshot_cached")
+        self.assertEqual(cached["snapshotId"], pub["snapshotId"])
+        st, later = self._call("b", "GET", "/api/cloud/sync/watch?since=%d" % w["lastSeq"])
+        self.assertEqual(st, 200)
+        self.assertTrue(all(e["seq"] > w["lastSeq"] for e in later["events"]))
+        st, status = self._call("b", "GET", "/api/cloud/status")
+        self.assertEqual(st, 200)
+        self.assertTrue(status["syncWatch"]["running"])
+        self.assertEqual(status["syncWatch"]["runId"], run_id)
+
+        st, stopped = self._call("b", "POST", "/api/cloud/sync/watch/stop", {})
+        self.assertEqual(st, 200)
+        self.assertEqual(stopped["status"], "cancelled")
+        self.assertFalse(stopped["running"])
+        self.assertGreaterEqual(stopped["counters"]["snapshotsCached"], 1)
+        with E._workspace_operation(self.home_b):
+            pass  # the worker released the per-round lock
+        st, status = self._call("b", "GET", "/api/cloud/status")
+        self.assertFalse(status["syncWatch"]["running"])
+        self.assertEqual(status["lastSync"]["status"], "cancelled")
+        self.assertFalse(status["lastSync"]["running"])
+        st, once = self._call("b", "POST", "/api/cloud/sync", {})
+        self.assertEqual(st, 200)
+        self.assertEqual(once["status"], "success")
+
+    def test_cloud_error_bodies_carry_error_class(self):
+        st, d = self._call("a", "POST", "/api/cloud/sync", {})
+        self.assertEqual(st, 400)
+        self.assertEqual((d["code"], d["errorClass"]), ("not_configured", "needs_user_action"))
+        st, d = self._call("a", "POST", "/api/cloud/sync/watch", {})
+        self.assertEqual(st, 400)
+        self.assertEqual(d["errorClass"], "needs_user_action")
+
+
+class PhaseDDiagnosticsApiTest(unittest.TestCase):
+    """CLI, local API and web page show the same reasons and recovery commands (one shared function)."""
+
+    def setUp(self):
+        from test_reissue import _ReissueBase
+
+        class _Net(_ReissueBase):
+            def runTest(self):  # pragma: no cover - only used as a fixture holder
+                pass
+
+        self.net = _Net()
+        self.net.setUp()
+        self.addCleanup(self.net.doCleanups)
+
+    def _server(self, alias):
+        from relaydesk import cli
+        html = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "relay-desk.html")
+        srv = server.make_server(html, cli._FileStore(self.net.devices[alias]["led"]), 0)
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def _call(self, alias, port, method, path, body=None):
+        h = {"Host": "127.0.0.1:%d" % port}
+        if method != "GET":
+            h["X-Relay-Desk"] = "1"
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        with self.net.env(alias):
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+            try:
+                c.putrequest(method, path, skip_host=True)
+                for k, v in h.items():
+                    c.putheader(k, v)
+                if data is not None:
+                    c.putheader("Content-Type", "application/json")
+                    c.putheader("Content-Length", str(len(data)))
+                c.endheaders(data)
+                r = c.getresponse()
+                raw = r.read()
+                return r.status, (json.loads(raw.decode("utf-8")) if raw else None)
+            finally:
+                c.close()
+
+    def test_cli_api_and_web_show_identical_reasons_and_commands(self):
+        from test_reissue import _run_cli
+        net = self.net
+        sent = net.send("alpha", "beta")
+        net.rotate("beta")
+        net.reconfirm("alpha", "beta")
+        net.rotate("gamma")
+        net.sync("gamma")
+        net.sync("alpha")  # gamma becomes key_changed on alpha
+        port = self._server("alpha")
+        with net.env("alpha"):
+            cli_json = json.loads(_run_cli(["doctor", "--json"])["out"])
+            cli_text = _run_cli(["doctor"])
+        st, api = self._call("alpha", port, "GET", "/api/cloud/doctor")
+        self.assertEqual(st, 200, api)
+        key = lambda d: [(f["code"], f["severity"], f["reason"], f["command"]) for f in d["findings"]]
+        self.assertEqual(key(api), key(cli_json))
+        self.assertEqual(api["projects"], cli_json["projects"])
+        self.assertEqual(cli_text["rc"], 4)
+        codes = [f["code"] for f in api["findings"]]
+        self.assertIn("handoff_recipient_key_changed", codes)
+        self.assertIn("peer_key_changed", codes)
+        for f in api["findings"]:
+            self.assertIn("原因：%s" % f["reason"], cli_text["out"])
+            self.assertIn("处理命令：%s" % f["command"], cli_text["out"])
+        reissue = [f for f in api["findings"] if f["code"] == "handoff_recipient_key_changed"][0]
+        # the engine's error (CLI and API) carries the very same command
+        st, err = self._call("alpha", port, "POST", "/api/cloud/send", {"project": "demo", "to": "beta"})
+        self.assertEqual((st, err["code"], err["action"]), (409, "handoff_recipient_key_changed", reissue["command"]))
+        with net.env("alpha"):
+            cli_err = _run_cli(["send", "demo", "--to", "beta"])
+        self.assertIn(reissue["command"], cli_err["err"])
+        # the web page renders exactly those reasons and commands
+        from test_ui_skills import _find_node, esc_html, phase_d_fixture, render_phase_d
+        node_bin = _find_node()
+        if node_bin:
+            html = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "relay-desk.html")
+            out = render_phase_d(node_bin, html, phase_d_fixture(api))
+            for f in api["findings"]:
+                self.assertIn(esc_html(f["reason"]), out["inbox"])
+                self.assertIn('<code class="dx-command">%s</code>' % esc_html(f["command"]), out["inbox"])
+            for pv in api["projects"]:
+                self.assertIn("当前编辑设备：%s" % esc_html(pv["editor"]["name"]), out["inbox"])
+        # cache status and dry-run: same function behind CLI and API
+        with net.env("alpha"):
+            cli_status = json.loads(_run_cli(["cache", "status", "--json"])["out"])
+            cli_dry = json.loads(_run_cli(["cache", "prune", "--json"])["out"])
+        st, api_status = self._call("alpha", port, "GET", "/api/cloud/cache")
+        self.assertEqual((st, api_status), (200, cli_status))
+        st, api_dry = self._call("alpha", port, "POST", "/api/cloud/cache/prune", {"mode": "dry-run"})
+        self.assertEqual(st, 200)
+        self.assertEqual(api_dry["planDigest"], cli_dry["planDigest"])
+        st, bad = self._call("alpha", port, "POST", "/api/cloud/cache/prune", {"mode": "now"})
+        self.assertEqual(st, 400)
+        st, changed = self._call("alpha", port, "POST", "/api/cloud/cache/prune",
+                                 {"mode": "apply", "expectPlan": "0" * 64})
+        self.assertEqual((st, changed["code"]), (409, "prune_plan_changed"))
+        # explicit re-issue through the API
+        st, res = self._call("alpha", port, "POST", "/api/cloud/send", {"project": "demo", "to": "beta", "reissue": True})
+        self.assertEqual(st, 200, res)
+        self.assertEqual(res["supersedesRelayId"], sent["relayId"])
+        st, bad = self._call("alpha", port, "POST", "/api/cloud/send", {"project": "demo", "to": "beta", "reissue": "yes"})
+        self.assertEqual(st, 400)
+        st, after = self._call("alpha", port, "GET", "/api/cloud/doctor?project=demo")
+        self.assertIn("handoff_superseded", [f["code"] for f in after["findings"]])
+        self.assertNotIn("handoff_recipient_key_changed", [f["code"] for f in after["findings"]])
 
 
 if __name__ == "__main__":

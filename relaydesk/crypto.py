@@ -9,26 +9,38 @@ import copy
 import hashlib
 import json
 import os
+import re
 import secrets
 import struct
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from . import validation
 
 __all__ = [
     "CryptoError",
     "CryptoUnavailableError",
     "TamperError",
+    "InvalidSignedFieldError",
+    "IdentityCorruptError",
+    "load_identity",
     "has_crypto",
     "require_crypto",
     "ensure_identity",
+    "rotate_identity_keys",
     "public_descriptor",
+    "public_descriptor_v3",
     "device_fingerprint",
     "pair_fingerprint",
     "sign_json",
     "verify_json",
+    "sign_snapshot",
+    "verify_snapshot",
+    "snapshot_record_digest",
+    "check_snapshot_body",
     "encrypt_package",
     "decrypt_package",
     "encrypt_meta",
@@ -52,6 +64,7 @@ PUBLIC_DESCRIPTOR_FIELDS = (
 )
 
 DEFAULT_CHUNK_SIZE = 65536
+MAX_PREVIOUS_KEYS = 10  # retired public keys kept in identity.json after rotations
 MAX_FRAME_CIPHERTEXT_BYTES = 64 * 1024 * 1024  # hard safety cap against bogus frame headers
 
 
@@ -65,6 +78,33 @@ class CryptoUnavailableError(CryptoError):
 
 class TamperError(CryptoError):
     """Raised when signature verification, MAC check, hash, or stream framing fails."""
+
+    category = validation.CATEGORY_INTEGRITY
+
+
+class InvalidSignedFieldError(TamperError):
+    """A record verified, but one of its fields is malformed, unsafe, or inconsistent.
+
+    ``code`` is ``invalid_identifier``, ``field_mismatch`` or ``path_escape``.
+    """
+
+    def __init__(self, message: str, code: str = "invalid_identifier", field: str = "") -> None:
+        TamperError.__init__(self, message)
+        self.message = message
+        self.code = code
+        self.field = field
+
+    @classmethod
+    def from_validation(cls, err: "validation.ValidationError", context: str = "") -> "InvalidSignedFieldError":
+        msg = "%s：%s" % (context, err.message) if context else err.message
+        return cls(msg, code=err.code, field=err.field)
+
+
+class IdentityCorruptError(CryptoError, validation.LocalStateCorruptError):
+    """`identity.json` exists but cannot be used. Never replaced by a new identity."""
+
+    def __init__(self, message: str, path: str = "") -> None:
+        validation.LocalStateCorruptError.__init__(self, message, path=path, kind="identity")
 
 
 # ---------------------------------------------------------------- availability
@@ -249,6 +289,54 @@ def pair_fingerprint(desc_1: dict, desc_2: dict) -> str:
     return _format_hex_groups(digest, 4)
 
 
+_IDENTITY_HINT = "为避免生成新身份导致对端信任失效，操作已停止；请从备份恢复该文件，不要直接删除。"
+
+
+def _load_and_validate_identity(ident_path: Path) -> Dict[str, Any]:
+    """Load and validate an existing `identity.json` file (raises IdentityCorruptError)."""
+    required_keys = (
+        "deviceId",
+        "signPrivateKey",
+        "verifyPublicKey",
+        "boxPrivateKey",
+        "boxPublicKey",
+    )
+    try:
+        with open(ident_path, "r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        raise IdentityCorruptError("读取本机身份文件失败 %s：%s。%s" % (ident_path, e, _IDENTITY_HINT), path=str(ident_path))
+    if not isinstance(data, dict):
+        raise IdentityCorruptError("本机身份文件格式无效（顶层不是对象）：%s。%s" % (ident_path, _IDENTITY_HINT), path=str(ident_path))
+    for k in required_keys:
+        if not isinstance(data.get(k), str) or not data[k].strip():
+            raise IdentityCorruptError("本机身份文件缺少必要密钥字段 %s：%s。%s" % (k, ident_path, _IDENTITY_HINT), path=str(ident_path))
+    try:
+        validation.validate_device_id(data["deviceId"], "identity.deviceId")
+    except validation.ValidationError as e:
+        raise IdentityCorruptError("本机身份文件的 deviceId 无效（%s）：%s。%s" % (e.message, ident_path, _IDENTITY_HINT), path=str(ident_path))
+    for k in ("signPrivateKey", "verifyPublicKey", "boxPrivateKey", "boxPublicKey"):
+        try:
+            raw = _b64d(data[k], k, tamper=False)
+        except CryptoError as e:
+            raise IdentityCorruptError("本机身份文件密钥 %s 无法解码：%s。%s" % (k, ident_path, _IDENTITY_HINT), path=str(ident_path)) from e
+        if len(raw) != 32:
+            raise IdentityCorruptError("本机身份文件密钥长度异常 %s：%s。%s" % (k, ident_path, _IDENTITY_HINT), path=str(ident_path))
+    return data
+
+
+def load_identity(local_home) -> Optional[Dict[str, Any]]:
+    """Read-only: the validated identity, ``None`` if never created, or IdentityCorruptError.
+
+    Never writes. Use it wherever an identity is only needed for reading (status,
+    per-round reloads); ``ensure_identity`` creates or updates the file.
+    """
+    ident_path = Path(local_home) / "identity.json"
+    if not os.path.lexists(str(ident_path)):
+        return None
+    return copy.deepcopy(_load_and_validate_identity(ident_path))
+
+
 def ensure_identity(
     local_home,
     alias: str = "",
@@ -259,30 +347,12 @@ def ensure_identity(
     """Load or generate `<local_home>/identity.json` with 0600 permissions."""
     home_path = Path(local_home)
     ident_path = home_path / "identity.json"
-    required_keys = (
-        "deviceId",
-        "signPrivateKey",
-        "verifyPublicKey",
-        "boxPrivateKey",
-        "boxPublicKey",
-    )
 
-    if ident_path.exists():
-        try:
-            with open(ident_path, "r", encoding="utf-8-sig") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError, UnicodeDecodeError) as e:
-            raise CryptoError("读取本机身份文件失败 %s：%s" % (ident_path, e))
-        if not isinstance(data, dict):
-            raise CryptoError("本机身份文件格式无效（顶层不是对象）：%s" % ident_path)
-        for k in required_keys:
-            if not isinstance(data.get(k), str) or not data[k].strip():
-                raise CryptoError("本机身份文件缺少必要密钥字段 %s：%s" % (k, ident_path))
-        # Validate stored key lengths
-        for k in ("signPrivateKey", "verifyPublicKey", "boxPrivateKey", "boxPublicKey"):
-            raw = _b64d(data[k], k, tamper=False)
-            if len(raw) != 32:
-                raise CryptoError("本机身份文件密钥长度异常 %s：%s" % (k, ident_path))
+    # lexists: a dangling symlink is a broken identity, not a missing one.
+    loaded: Optional[Dict[str, Any]] = None
+    if os.path.lexists(str(ident_path)):
+        data = _load_and_validate_identity(ident_path)
+        loaded = copy.deepcopy(data)
     else:
         _, signing, public, _ = _require_nacl()
         sk = signing.SigningKey.generate()
@@ -319,11 +389,62 @@ def ensure_identity(
     data["keyFingerprint"] = device_fingerprint(
         data["verifyPublicKey"], data["boxPublicKey"]
     )
+    if data != loaded:
+        _write_private_json(ident_path, data)
+    return copy.deepcopy(data)
+
+
+def rotate_identity_keys(local_home) -> dict:
+    """Rotate Ed25519 and X25519 keypairs in `<local_home>/identity.json` while keeping deviceId."""
+    _, signing, public, _ = _require_nacl()
+    home_path = Path(local_home)
+    ident_path = home_path / "identity.json"
+    if not os.path.lexists(str(ident_path)):
+        raise CryptoError("本机身份文件不存在，无法轮换密钥：%s" % ident_path)
+
+    data = _load_and_validate_identity(ident_path)
+    data.setdefault("alias", "")
+    data.setdefault("name", "")
+    data.setdefault("os", "")
+    data.setdefault("host", "")
+    data.setdefault("createdAt", _now_iso())
+
+    # Keep the retired *public* keys (never the private ones: a rotation may be
+    # because of a compromise) so this device can still check evidence it signed
+    # before, e.g. its own older snapshots in the version graph. They grant no
+    # new rights: nothing new is ever signed or sealed with them.
+    retired_at = _now_iso()
+    previous = [p for p in (data.get("previousKeys") or []) if isinstance(p, dict)] \
+        if isinstance(data.get("previousKeys"), list) else []
+    previous.append({
+        "verifyPublicKey": data["verifyPublicKey"],
+        "boxPublicKey": data["boxPublicKey"],
+        "keyFingerprint": device_fingerprint(data["verifyPublicKey"], data["boxPublicKey"]),
+        "createdAt": str(data.get("rotatedAt") or data.get("createdAt") or ""),
+        "retiredAt": retired_at,
+    })
+    data["previousKeys"] = previous[-MAX_PREVIOUS_KEYS:]
+
+    sk = signing.SigningKey.generate()
+    bk = public.PrivateKey.generate()
+    data["signPrivateKey"] = _b64e(sk.encode())
+    data["verifyPublicKey"] = _b64e(sk.verify_key.encode())
+    data["boxPrivateKey"] = _b64e(bk.encode())
+    data["boxPublicKey"] = _b64e(bk.public_key.encode())
+    data["keyFingerprint"] = device_fingerprint(
+        data["verifyPublicKey"], data["boxPublicKey"]
+    )
+    data["rotatedAt"] = retired_at
+
     _write_private_json(ident_path, data)
     return copy.deepcopy(data)
 
 
-def public_descriptor(identity: dict) -> dict:
+def public_descriptor(
+    identity: dict,
+    protocol_version: Optional[int] = None,
+    capabilities: Optional[List[str]] = None,
+) -> dict:
     """Extract strictly public identity fields (never exposing private keys)."""
     if not isinstance(identity, dict):
         raise CryptoError("身份对象必须是字典。")
@@ -335,7 +456,7 @@ def public_descriptor(identity: dict) -> dict:
     if not isinstance(fp, str) or not fp.strip():
         fp = device_fingerprint(identity["verifyPublicKey"], identity["boxPublicKey"])
 
-    out = {
+    out: Dict[str, Any] = {
         "deviceId": str(identity["deviceId"]),
         "alias": str(identity.get("alias") or ""),
         "name": str(identity.get("name") or ""),
@@ -346,7 +467,25 @@ def public_descriptor(identity: dict) -> dict:
         "keyFingerprint": fp,
         "createdAt": str(identity.get("createdAt") or ""),
     }
-    return {k: out[k] for k in PUBLIC_DESCRIPTOR_FIELDS}
+    result: Dict[str, Any] = {k: out[k] for k in PUBLIC_DESCRIPTOR_FIELDS}
+    if protocol_version is not None:
+        result["protocolVersion"] = int(protocol_version)
+    if capabilities is not None:
+        result["capabilities"] = [str(c) for c in capabilities]
+    if (protocol_version is not None and int(protocol_version) >= 3) or capabilities is not None:
+        rotated_at = identity.get("rotatedAt")
+        if isinstance(rotated_at, str) and rotated_at.strip():
+            result["rotatedAt"] = rotated_at
+    return result
+
+
+def public_descriptor_v3(
+    identity: dict,
+    capabilities: Optional[List[str]] = None,
+) -> dict:
+    """Extract public identity fields for v3 protocol with capabilities and optional rotatedAt."""
+    caps = list(capabilities) if capabilities else ["v2", "v3"]
+    return public_descriptor(identity, protocol_version=3, capabilities=caps)
 
 
 # ---------------------------------------------------------------- Ed25519 JSON signing
@@ -431,6 +570,97 @@ def verify_json(
         raise TamperError("Ed25519 签名验证失败，数据可能已被篡改。")
 
     return body
+
+
+_HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _validate_snapshot_body(snapshot_obj: Any, tamper: bool = False) -> None:
+    err_cls = TamperError if tamper else CryptoError
+    if not isinstance(snapshot_obj, dict):
+        raise err_cls("快照对象必须是字典。")
+    for key in ("projectId", "versionId"):
+        val = snapshot_obj.get(key)
+        if not isinstance(val, str) or not val.strip():
+            raise err_cls("快照缺少有效字段：%s" % key)
+    sha = snapshot_obj.get("contentSha256")
+    if not isinstance(sha, str) or not _HEX64_RE.match(sha):
+        raise err_cls("快照 contentSha256 必须是 64 位十六进制 SHA-256。")
+    # Identifiers are used as cache/archive path segments and object-key
+    # segments, so a valid signature is not enough on its own.
+    try:
+        validation.validate_snapshot_fields(snapshot_obj)
+    except validation.ValidationError as e:
+        if tamper:
+            raise InvalidSignedFieldError.from_validation(e, "快照字段无效")
+        raise CryptoError("快照字段无效：%s" % e.message)
+
+
+def snapshot_record_digest(signed_snapshot: dict) -> str:
+    """SHA-256 of a signed snapshot record (canonical JSON, signature included).
+
+    Recorded in version-graph nodes as evidence of exactly which signed record
+    was verified, so it can be re-checked later without trusting a key again.
+    """
+    if not isinstance(signed_snapshot, dict):
+        raise TamperError("快照记录格式无效：顶层不是对象。")
+    return hashlib.sha256(_canonical_json_bytes(signed_snapshot)).hexdigest()
+
+
+def sign_snapshot(
+    snapshot_obj: dict,
+    sign_priv_b64: str,
+    author_device_id: str,
+) -> dict:
+    """Validate snapshot fields and sign with the author's Ed25519 key."""
+    if not isinstance(author_device_id, str) or not author_device_id.strip():
+        raise CryptoError("author_device_id 必须是非空字符串。")
+    _validate_snapshot_body(snapshot_obj, tamper=False)
+
+    body = copy.deepcopy(snapshot_obj)
+    body["authorDeviceId"] = author_device_id
+    body["formatVersion"] = 3
+    return sign_json(body, sign_priv_b64, signer_device_id=author_device_id)
+
+
+def verify_snapshot(
+    signed_snapshot: dict,
+    author_verify_pub_b64: str,
+    expected_author_id: Optional[str] = None,
+) -> dict:
+    """Verify Ed25519 author signature and required metadata on a signed snapshot."""
+    verified = verify_json(
+        signed_snapshot,
+        author_verify_pub_b64,
+        expected_device_id=expected_author_id,
+    )
+    return check_snapshot_body(verified, expected_author_id)
+
+
+def check_snapshot_body(verified: dict, expected_author_id: Optional[str] = None) -> dict:
+    """The checks ``verify_snapshot`` runs after the signature: author/signer identity and fields.
+
+    For callers that already verified the signature with ``verify_json`` (for
+    example while trying a device's current and retired keys) and must not pay
+    for a second signature check.
+    """
+    if not isinstance(verified, dict):
+        raise TamperError("快照记录格式无效：顶层不是对象。")
+    author_id = verified.get("authorDeviceId")
+    signer_id = verified.get("signerDeviceId")
+    if not isinstance(author_id, str) or not author_id.strip():
+        raise TamperError("快照缺少有效的 authorDeviceId。")
+    if not isinstance(signer_id, str) or not signer_id.strip():
+        raise TamperError("快照缺少有效的 signerDeviceId。")
+    if author_id != signer_id:
+        raise TamperError("快照作者设备身份（authorDeviceId）与签名设备身份（signerDeviceId）不一致。")
+    if expected_author_id is not None and author_id != expected_author_id:
+        raise TamperError(
+            "快照作者设备身份不匹配：期望 %s，实际 %s。"
+            % (expected_author_id, author_id)
+        )
+    _validate_snapshot_body(verified, tamper=True)
+    return copy.deepcopy(verified)
 
 
 # ---------------------------------------------------------------- secretstream package crypto

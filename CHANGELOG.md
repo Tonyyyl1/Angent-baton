@@ -1,28 +1,84 @@
 # Changelog
 
-## Unreleased
+## Unreleased / v3 continuous sync, key rotation, and diagnostics
+
+Upgrade notes: [docs/MIGRATION.md](./docs/MIGRATION.md). Protocol details: [docs/SPEC.md](./docs/SPEC.md) §2.4–2.6, §3.1, §4.2–4.5, §5.5–5.6, §8, §9.
 
 ### Added
-
-- Encrypted asynchronous cloud handoff with per-device identities, a shared pairing fingerprint, Ed25519 signatures, and libsodium streaming encryption.
-- `StorageProvider` adapters for local directories and `rclone` remotes. The integration suite exercises WebDAV and S3-compatible services on loopback.
-- Git bundle and workspace transfer for eligible staged, unstaged, and untracked changes, plus snapshots of non-Git folders.
-- Searchable archives of supported Claude Code, Codex, and Antigravity conversations, with gap reporting and deduplication across transfers.
-- Cloud pairing, inbox, and transcript views in the local workbench. Agent skills can invoke the cloud workflow after pairing.
+- **Continuous sync with classified errors.** `relay sync` and `relay sync --watch` now emit events round by round. New `--jsonl` streams one JSON event per line (`relaydesk.sync/1`) and ends with a `summary` line; it cannot be combined with `--json`. New `--max-backoff S` (default 300). Errors are classified as `transient_transport`, `needs_user_action`, `integrity`, or `local_busy`. Transient failures back off per peer with capped jitter, and one failing peer no longer blocks the others. Integrity failures are quarantined and reported once. Each round re-reads identity and trust, so a rotation or re-pairing takes effect without a restart.
+- **Bounded run state.** At most 200 recent events are kept, with a truncation flag, alongside separate cumulative counters. The older result lists are capped at 200 entries each (`legacyListsTruncated`). The last run's result and heartbeat are saved in `<RELAY_DESK_HOME>/sync_status.json`.
+- **Sync exit codes** 0 success, 3 partial, 4 needs action, 130 cancelled (Ctrl+C or SIGTERM still print the final summary and release locks).
+- **Watch API and UI.** `POST /api/cloud/sync/watch`, `GET /api/cloud/sync/watch?since=SEQ`, `POST /api/cloud/sync/watch/stop`; `/api/cloud/status` gains `syncWatch` and `lastSync`; cloud error bodies carry `errorClass`. The web page's 待接棒 tab adds a 持续同步 toggle and status panel.
+- **Key-aware delivery state.** New local file `deliveries.json` (format 1) records cache deliveries per (receiver, receiver key fingerprint, snapshot) with generations. Delivery IDs now name the receiver key: `(sync|fwd)_<snapshot>_<sender6>_k<fp8>[_gN]`. After a re-confirmed key rotation, the sender publishes a new delivery with new ciphertext. Original deliveries, receipts, and packages are never rewritten.
+- **Signed have v2** with `haveFormat`, `keyFingerprint`, an increasing `seq`, and `needs`, so a device that lost or could not verify a cached snapshot asks for it again. The states published, peer-verified cache, and claimed are kept separate; a have never counts as a claim.
+- **Key history.** Rotations keep the retired public keys in `identity.json` `previousKeys`. Re-confirmations keep the previously confirmed peer key in `cloud.json` `peers[*].keyHistory`. Version-graph nodes record `authorKeyFingerprint`, `trust`, and `recordSha256`. Historical keys validate old evidence only and grant no new rights.
+- **`relay send PROJECT --to DEVICE --reissue`** re-issues an in-flight handoff whose target or sender changed keys. It uses a new relay ID and new ciphertext for the same snapshot, with signed `supersedesRelayId`/`supersedesRelayIds`; the original stays untouched and the target can claim only one. `POST /api/cloud/send` accepts `reissue: true`.
+- **Rotation guard.** `relay device --rotate-keys` refuses (exit 4) while a send, handoff, receipt upload, or receive transaction is unfinished. `--force` rotates anyway and lists the affected handoffs.
+- **`relay doctor [PROJECT] [--json]`**: strictly read-only diagnostics with a stable code, a reason, and one command per finding (exit 0/3/4). The same reason and command appear in CLI errors, the API (`GET /api/cloud/doctor`), and the web page.
+- **`relay cache status`** and **`relay cache prune`**. Prune previews by default; `--apply` recomputes the plan inside the local lock; `--expect-plan DIGEST` refuses a changed plan. It keeps current and fork heads, in-flight and recovery snapshots, unconfirmed deliveries, and all signed lineage. It tombstones before deleting, can resume after interruption, and never touches the cloud, `processedDeliveries`, or credentials. API: `GET /api/cloud/cache`, `POST /api/cloud/cache/prune`.
+- **Web 接力网络状态 panel** shows, per project, the current editor, in-flight handoffs, and confirmed / awaiting / resend / unknown devices, with 重新诊断, a dry-run-only 预览缓存清理, and a 为当前公钥重新签发交接 button after a key-change send error. 未知 means no recent manifest, never offline.
+- **Acceptance tooling** (`acceptance/`): environment probe, synthetic fixtures, round-trip state comparison, native runners (`run-native.sh`, `run-native.ps1`), a three-device ring driver (`ring.py simulate | device | runbook | aggregate`), a loopback soak driver (`sync_soak.py`), and source digests. Results are labelled by the detected platform level, so a simulation is never reported as native or multi-device.
+- `publish` reports per-peer delivery failures in `deliveryErrors` and `status` instead of aborting at the first failing peer.
 
 ### Changed
-
-- The CLI adds `cloud remotes`, `pair`, `send`, `inbox`, `receive`, and `transcripts`. The manual checklist workflow remains available without cloud dependencies.
-- Project and session matching now resolves macOS `/var` and `/private/var` aliases and normalizes Unicode paths.
-- Device setup records platform information used by cross-platform filename checks.
+- **Stricter identifier validation** after signature verification: `versionId`, `deviceId`, `relayId`, delivery IDs, `projectId`, and `parentVersionIds` have explicit rules (see SPEC §4.5). Signed fields must agree with the ready marker, the cloud path, the payload metadata, and the encrypted preview. A project whose ID breaks the new `projectId` rule can still be read but can no longer be published, sent, or received.
+- **Write-path containment.** Cache, archive, transaction, and checkpoint directories under `RELAY_DESK_HOME` must not be symlinks (`symlink_in_path`). On receive, symlink entries must be relative and stay inside the project.
+- **Strict local state loading.** A damaged `identity.json`, `cloud.json`, `relay_state.json`, `config.json`, `deliveries.json`, transaction `meta.json`, or sync checkpoint now stops with `local_state_corrupted` (or a more specific code) and is left unchanged, instead of being reset to an empty default. `identity.json` is no longer rewritten when nothing changed.
+- `relay sync` summary `ok` now equals `status == "success"` (it was always `true`). `errors` entries gain `errorClass`, `code`, `stage`, and `peerDeviceId`.
+- `forwardedSnapshots` is no longer the dedupe authority (it is still written for older builds); `processedDeliveries` no longer prevents repairing a lost or corrupted cache.
+- **In-place receive keeps Git-ignored files.** Git-ignored files (`build/`, `*.log`, `node_modules/`, …) no longer block receiving into an existing working tree and are kept untouched through apply, rollback, and resume. The receive is refused before any write if the package would overwrite, replace, or un-ignore a kept file.
 
 ### Fixed
+- Signed snapshots with path-like `versionId`/`projectId`, self-parents, mismatched projects, or a `relayId` bound to another handoff could write outside the cache or be replayed. They are now rejected before any write.
+- Damaged `relay_state.json` or `cloud.json` was silently overwritten, losing pending handoffs or pairings. A dangling `identity.json` symlink caused a new identity to be generated.
+- `publish` aborted at the first failing peer. Storage, receipt, and busy errors ended `sync --watch`. Ctrl+C returned `ok: true`. Invalid deliveries were downloaded and reported again every round.
+- After a key rotation, deliveries signed by or sealed to the old key were reported as tampering every round and never redelivered. Receipts signed by a retired key were never accepted. Retrying `send` reported tampering instead of a key change. The same snapshot was delivered to the same peer 2–3 times.
+- A lost or corrupted local cache was never refilled because `processedDeliveries` skipped the delivery.
+- A third device could wrap a `key_changed` author's snapshot into a valid-looking handoff.
+- Taking a project back into its original folder was refused when the folder held git-ignored files (`build/`, `*.log`, `node_modules/`). Ignored files are now kept in place as SPEC §6 describes. A receive is still refused if the incoming state would overwrite, re-type or un-ignore a kept path.
+- After a sender key rotation, a missing middle snapshot made `relay sync` report a fork on a linear chain. Sync now fetches and verifies missing signed ancestors as `receive` does. When no verifiable copy exists, it records insufficient evidence (`lineagePending`, doctor `lineage_unproven`) instead of a fork.
+- A delivery refused because the cache or archive directory was a symlink stayed an unresolved integrity problem after the directory was fixed. It is now `needs_user_action` / `local_dir_symlink`, and the same cloud delivery is processed on the next sync.
+- `relay add`, `relay import` and the ledger API accepted project IDs that `publish` later rejected, such as `.hidden`. New IDs are now validated; existing ones still load and are reported by `relay doctor` as `project_id_invalid`.
+- A `publish` whose signed snapshot record failed to upload left that snapshot as the local head. The next snapshot named a parent that was never in the cloud, and every receiver of a later handoff reported `lineage_incomplete` ("缺少可验证的父版本 … 请恢复云端记录") until the end of a 2-hour WebDAV soak. Version-graph nodes now carry `recordPublished` once the record is confirmed. Before `publish` or `send` chains onto the local head, and when `send` is re-run for a stuck handoff, any unconfirmed ancestor this device authored has its record written again from the local cache. If that write fails, nothing new is committed. A transport failure while fetching an ancestor is still transient, never "missing".
+- One reset connection aborted `receive`, `publish` or `send`. Commands now retry idempotent reads (list, stat, download) up to 4 attempts within 12 s, with capped exponential backoff (0.5 s base, 4 s cap) and jitter. A not-found answer, authorization, configuration or invalid-key errors, and integrity failures are never retried. Uploads and deletes stay single-shot. A write-once record whose upload answer was lost is confirmed by the next run, which reads it before writing. `relay sync` rounds still fail fast and back off between rounds.
+- `receive` failed with `local_busy` whenever a `sync --watch` round held the workspace lock. It now waits up to 20 s for a sync round, and only for a sync round, before reporting `local_busy`.
+- Each delivery during a `publish` or `send` read the snapshot record twice more and probed its ready marker twice. A publish to two peers now makes 14 storage calls instead of 22.
+- `recover --rollback` of a pending send ignored a failed cloud check and dropped the send record, even when the handoff was already published and claimable. That could leave two owners. It now fails closed with `rollback_cloud_check_failed` and keeps the record. Re-run it once the network is back, or re-run `send`.
 
-- Reject in-place receives that would remove Git-ignored local files, replace divergent branches or tags, or collide with locally preserved credential files. Compatible branch updates can fast-forward. Local-only refs are retained.
-- Keep the original encrypted package and signed ready marker when resuming an interrupted publication. Validate a signed receipt against the handoff ID, recipient, project, and package SHA-256 before marking the transfer acknowledged.
-- Complete archive writes before applying the workspace. Prepare new destinations before moving them into place. Resume ledger updates and receipt delivery after the workspace has been applied, preserving subsequent local edits.
+### Performance
+- **Cache-check memo for watch rounds.** `delivery_state.CacheIndex` reuses a positive cache verification only while the files' lstat signatures, the expected record digest and a 7-day validity window are all unchanged. Negative results and symlinked entries always get the full check, and claim still fully verifies, decrypts and checks the digest. Steady-state watch round on a local directory (median of 9): 10 devices × 10,000 history 4.81 s → 2.78 s, 3 × 10,000 4.44 s → 2.42 s, 3 × 1,000 462 ms → 258 ms. Storage calls, bytes and signature checks are unchanged. Remote backends gain less because listing dominates (WebDAV 1–2%, S3 12–14% on local rclone servers).
+- Known cost: the first round after upgrading from the repair version is slower (10 × 10,000: 12.8 s on the repair version, 35.9 s now) because `deliveries.json` is rebuilt from existing checkpoints. Public-cloud figures are not measured yet.
 
-## v1
+### Compatibility
+- Recovery journals still write format 2 and read formats 1 and 2. The old A/B v2 protocol is unchanged. Earlier v3 builds keep interoperating, but they do not publish `seq`/`needs` and they refuse re-issued handoffs (see MIGRATION.md).
+
+## Unreleased / v3 Personal Multi-Device Relay Network
+
+### Added
+- **Unified N-Device Model (v3)**: Expands relay-desk from 2-device (`a`/`b`) static pairing to an arbitrary N-device mesh (`a`, `b`, `c`, or custom aliases such as `mac-studio`) with unique cryptographic `deviceId`s, alias validation (`ALIAS_RE`), duplicate `id`/`deviceId`/`name` rejection in `norm_config`, and idempotent ledger identity mapping (`migrate_ledger_identities`).
+- **Snapshot Caching vs. Active Handoff Split**: Decouples lightweight background snapshot publishing/syncing (`publish`, `sync`, `sync --watch` with offline publisher forwarding via `v3/have/<deviceId>.json`) from exclusive active workspace handoffs (`send --to DEVICE`, `inbox`, `receive`, enforcing `purpose: "handoff"` and `authorizedDeviceId`).
+- **Parent-Version Lineage & Fork Detection**: Tracks author-signed snapshot parent-version DAGs (`versionGraph` and `localCurrentVersion`) independently of the 10-entry display cap on `project["history"]`, detecting version regressions/replays (`version_regression`) and concurrent forks (`VersionConflictError`, `version_fork`) and recording conflicts in the ledger without touching workspaces.
+- **Transactional Workspace Crash Recovery (`workspace_tx`)**: Implements isolated-prep + journaled commit workspace transactions under `<local_home>/transactions/<relay_id>/` with SHA-256 checksummed journals (`journal.json`, `journalSha256`), `pre_blobs/` and `post_blobs/`, `.git/index` & `refs` & `HEAD` recovery, post-interruption user drift detection (`RecoveryConflictError`), corrupted journal halts (`CorruptedRecoveryError`), and fault injection hooks (`RELAY_DESK_FAULT_POINT`). Adds `recover <RELAY_ID> --status` / `--rollback` and `receive <RELAY_ID> --into <dir>`.
+- **Key Rotation & Collision Protection**: Adds `device --rotate-keys` (`rotate_identity_keys`), per-peer key-change isolation (`status: "key_changed"` / `KeyChangedError`), and alias/name collision rejection (`PeerConflictError`, `--replace-device --accept --fingerprint`, `--with <deviceId> --alias`).
+- **Capability-Based Protocol Negotiation & Benchmark**: Automatically selects v3 (`v3/devices/`, `v3/have/`, `v3/inbox/`) when peers advertise `"v3"`, uses the v2 adapter (`relays/<relayId>/`) for v2-only `a`/`b` peers without downgrading v3 peers on error, and adds `benchmarks/inbox_benchmark.py` (`--full`) for reproducible v2 vs v3 inbox/I/O benchmarking.
+
+### Changed
+- Cloud storage layout organized under `v3/` (`v3/devices/<deviceId>.json`, `v3/have/<deviceId>.json`, `v3/inbox/<receiverDeviceId>/<deliveryId>/`) alongside preserved `devices/{a,b}.json` and `relays/<relayId>/` compatibility paths.
+- Local operation serialization uses `<local_home>/workspace-operation.lock` (`fcntl.flock` / `msvcrt.locking`) alongside `<file>.lock`, unique immutable delivery keys, and content-hash snapshot deduplication under `StorageProvider`'s unconditional-put model.
+- Enhanced CLI and web workbench with N-device management, pairing fingerprint verification (`--with`, `--status`, `--accept --fingerprint`), snapshot publish/sync controls, and recovery tooling.
+
+### Fixed
+- Persist rollback direction before modifying files; interrupted rollback cannot produce a successful receipt. Once ledger updating starts, recovery completes the receive instead of rolling back its workspace.
+- Stage workspace file contents on the destination filesystem and replace them atomically, allowing recovery after a partial copy or process termination while preserving subsequent user edits.
+- Recognize a newly created workspace moved into place before its completion checkpoint by its recorded directory identity, preserving edits made after the interruption.
+- Reject `publish` during pending or active handoffs and synchronize receipts before checking ownership.
+- Retrieve and verify signed ancestor metadata automatically during receive; distinguish missing ancestry from a real fork. Add immutable `v3/snapshots/<versionId>.json` records, with a fallback for existing v3 ready markers.
+- Persist exact cache-delivery ciphertext and ready markers before publication and reuse them across forwarding retries.
+- Add regression tests for the five independently reproduced failures, including process termination during copy and rollback. Recovery journals now use format 2 while retaining format-1 reads.
+- Idempotent migration helpers (`migrate_cloud_config`, `migrate_relay_state`, `migrate_ledger_identities`) ensuring safe v1/v2 → v3 upgrades with one-time atomic backups (`<ledger>.v1.backup.json`, `cloud.v2.backup.json`, `relay_state.v2.backup.json`), safe handling of v2 `prepared` vs `needs_verification` `pendingSends`, and `workspaceApplied` protection for migrated `appliedReceives`.
+
+## v1 & v2
 
 - Introduced the two-device handoff ledger and manual checklists for Git remote, bundle, patch, and folder transfers.
+- Added encrypted asynchronous cloud handoff with per-device identities, shared pairing fingerprints, Ed25519 signatures, and libsodium streaming encryption (`StorageProvider` with `rclone` and local adapters).
 - Added CLI, local workbench, and agent skills for project registration, handoff records, and session lookup.

@@ -46,9 +46,44 @@ class TestNormalise(Base):
         self.assertEqual(c["extra"], 5)  # unknown field kept
 
     def test_norm_config_wrong_device_count_resets(self):
-        c = L.norm_config({"devices": [{"id": "a"}]})
-        self.assertEqual(len(c["devices"]), 2)
+        # Empty devices list resets to 2 default devices
+        c = L.norm_config({"devices": []})
+        self.assertEqual([d["id"] for d in c["devices"]], ["a", "b"])
         self.assertEqual(c["devices"][0]["name"], "设备 A")
+
+        # 1-device config is preserved and normalized
+        c1 = L.norm_config({"devices": [{"id": "a"}]})
+        self.assertEqual(len(c1["devices"]), 1)
+        self.assertEqual(c1["devices"][0]["id"], "a")
+        self.assertEqual(c1["devices"][0]["name"], "设备 A")
+        self.assertEqual(c1["devices"][0]["deviceId"], "")
+
+        # 3-device config preserves all entries, defaults deviceId to "", and keeps unknown keys
+        c3 = L.norm_config({
+            "devices": [
+                {"id": "a", "customA": 1},
+                {"id": "b", "os": "mac"},
+                {"id": "c", "name": "工作站 C", "os": "linux", "customC": "keep"},
+            ]
+        })
+        self.assertEqual([d["id"] for d in c3["devices"]], ["a", "b", "c"])
+        self.assertEqual(c3["devices"][0]["customA"], 1)
+        self.assertEqual(c3["devices"][2]["name"], "工作站 C")
+        self.assertEqual(c3["devices"][2]["customC"], "keep")
+        for d in c3["devices"]:
+            self.assertEqual(d["deviceId"], "")
+
+        # Duplicate case-insensitive id raises LedgerError
+        with self.assertRaises(L.LedgerError):
+            L.norm_config({"devices": [{"id": "a", "name": "One"}, {"id": "A", "name": "Two"}]})
+
+        # Duplicate case-insensitive non-empty name raises LedgerError
+        with self.assertRaises(L.LedgerError):
+            L.norm_config({"devices": [{"id": "a", "name": "Workstation"}, {"id": "b", "name": "workstation"}]})
+
+        # Duplicate non-empty deviceId raises LedgerError
+        with self.assertRaises(L.LedgerError):
+            L.norm_config({"devices": [{"id": "a", "deviceId": "dev_1"}, {"id": "b", "deviceId": "dev_1"}]})
 
     def test_norm_project_defaults(self):
         cfg = L.default_config()
@@ -85,10 +120,38 @@ class TestStorage(Base):
     def test_load_missing_is_empty(self):
         led = L.load(self.path)
         self.assertEqual(led["app"], "relaydesk")
-        self.assertEqual(led["version"], 1)
+        self.assertEqual(led["version"], L.VERSION)
+        self.assertEqual(led["version"], 2)
         self.assertEqual(led["projects"], [])
         self.assertEqual(led["config"], L.default_config())
         self.assertFalse(self.path.exists())
+
+    def test_v1_file_load_and_update_creates_backup_once(self):
+        raw_v1 = {
+            "app": "relaydesk",
+            "version": 1,
+            "config": L.default_config(),
+            "projects": [{"id": "p1", "name": "V1 Project", "device": "a"}],
+        }
+        raw_text = json.dumps(raw_v1, ensure_ascii=False, indent=1) + "\n"
+        self.path.write_text(raw_text, encoding="utf-8")
+
+        loaded = L.load(self.path)
+        self.assertEqual(loaded["version"], 1)
+
+        backup_path = Path(str(self.path) + ".v1.backup.json")
+        self.assertFalse(backup_path.exists())
+
+        updated1 = L.update(self.path, lambda l: l["projects"][0].update(note="first-v2-write"))
+        self.assertEqual(updated1["version"], 2)
+        self.assertEqual(L.load(self.path)["version"], 2)
+        self.assertTrue(backup_path.exists())
+        self.assertEqual(backup_path.read_text(encoding="utf-8"), raw_text)
+
+        updated2 = L.update(self.path, lambda l: l["projects"][0].update(note="second-v2-write"))
+        self.assertEqual(updated2["version"], 2)
+        self.assertEqual(updated2["projects"][0]["note"], "second-v2-write")
+        self.assertEqual(backup_path.read_text(encoding="utf-8"), raw_text)
 
     def test_round_trip_preserves_unknown_fields(self):
         raw = {

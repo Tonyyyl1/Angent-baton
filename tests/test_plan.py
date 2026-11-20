@@ -785,5 +785,136 @@ class Render(unittest.TestCase):
         self.assertNotIn("[x]", text)
 
 
+class MultiDevicePlan(unittest.TestCase):
+    def setUp(self):
+        self.cfg3 = {
+            "devices": [
+                {"id": "a", "name": "Win台式", "os": "windows", "drop": "D:\\drop", "host": "win", "deviceId": "dev_a"},
+                {"id": "b", "name": "MacBook", "os": "mac", "drop": "/Users/b/drop", "host": "mbp", "deviceId": "dev_b"},
+                {"id": "c", "name": "StudioMac", "os": "mac", "drop": "/Users/c/drop", "host": "studio", "deviceId": "dev_c"},
+            ],
+            "reg": {},
+        }
+
+    def test_three_device_os_slug(self):
+        # Two macs (b, c) get disambiguated slugs while unique windows (a) stays 'win'
+        self.assertEqual(plan.os_slug(self.cfg3["devices"][0], self.cfg3), "win")
+        self.assertEqual(plan.os_slug(self.cfg3["devices"][1], self.cfg3), "mac-b")
+        self.assertEqual(plan.os_slug(self.cfg3["devices"][2], self.cfg3), "mac-c")
+
+        # Three distinct OSes all stay unprefixed
+        cfg_distinct = copy.deepcopy(self.cfg3)
+        cfg_distinct["devices"][2]["os"] = "linux"
+        self.assertEqual(plan.os_slug(cfg_distinct["devices"][0], cfg_distinct), "win")
+        self.assertEqual(plan.os_slug(cfg_distinct["devices"][1], cfg_distinct), "mac")
+        self.assertEqual(plan.os_slug(cfg_distinct["devices"][2], cfg_distinct), "linux")
+
+    def test_three_device_tier_board(self):
+        sessions = [
+            {"tool": "claude", "device": "b", "kind": "local", "title": "OnB", "sessionId": "sb"},
+            {"tool": "claude", "device": "c", "kind": "local", "title": "OnC", "sessionId": "sc"},
+        ]
+        p = make_project(
+            device="a",
+            paths={"a": "D:\\p", "b": "/Users/b/p", "c": "/Users/c/p"},
+            sessions=sessions,
+            remote="origin",
+            dirty=0,
+        )
+        # Explicit to_id="c" treats c's session as native and b's session as manual
+        b_to_c = plan.tier_board(p, self.cfg3, to_id="c")
+        self.assertEqual(b_to_c["native"], [["Claude Code 本地 Session", "OnC。本来就在 StudioMac", False]])
+        self.assertEqual(b_to_c["manual"][0], ["Claude Code 本地 Session", "OnB。读摘要开新 Session", False])
+
+        # Without to_id or handoff in 3-device setup, sessions on any non-source device show as native
+        b_any = plan.tier_board(p, self.cfg3)
+        self.assertEqual(
+            b_any["native"],
+            [
+                ["Claude Code 本地 Session", "OnB。本来就在 MacBook", False],
+                ["Claude Code 本地 Session", "OnC。本来就在 StudioMac", False],
+            ],
+        )
+
+    def test_three_device_session_tiers(self):
+        self.assertEqual(
+            plan.session_tiers({"device": "a", "tool": "claude", "kind": "cloud"}, self.cfg3),
+            [["全部已登录设备", "native", ""]],
+        )
+        self.assertEqual(
+            plan.session_tiers({"device": "a", "tool": "claude", "kind": "remote"}, self.cfg3),
+            [
+                ["Win台式", "native", "在这里运行"],
+                ["MacBook", "native", "远程操作"],
+                ["StudioMac", "native", "远程操作"],
+            ],
+        )
+        self.assertEqual(
+            plan.session_tiers({"device": "a", "tool": "codex", "kind": "local", "carry": "summary"}, self.cfg3),
+            [
+                ["Win台式", "native", ""],
+                ["MacBook", "manual", "读摘要开新 Session"],
+                ["StudioMac", "manual", "读摘要开新 Session"],
+            ],
+        )
+        self.assertEqual(
+            plan.session_tiers({"device": "b", "tool": "anti", "kind": "local", "carry": "transcript"}, self.cfg3),
+            [
+                ["MacBook", "native", ""],
+                ["Win台式", "extra", "搬运 brain 目录供查阅，非官方"],
+                ["StudioMac", "extra", "搬运 brain 目录供查阅，非官方"],
+            ],
+        )
+
+    def test_three_device_new_handoff_explicit_to_id_vs_ambiguity(self):
+        p = make_project(
+            device="a",
+            paths={"a": "D:\\p", "b": "/Users/b/p", "c": "/Users/c/p"},
+            dirty=1,
+        )
+        d = datetime.date(2026, 11, 18)
+
+        # Omitting to_id with >1 other device raises LookupError
+        with self.assertRaises(LookupError) as ctx:
+            plan.new_handoff(p, self.cfg3, today=d)
+        self.assertIn("b", str(ctx.exception))
+        self.assertIn("c", str(ctx.exception))
+
+        # Explicit to_id by alias and by deviceId both succeed
+        h_c = plan.new_handoff(p, self.cfg3, transport="bundle", today=d, to_id="c")
+        self.assertEqual(h_c["from"], "a")
+        self.assertEqual(h_c["to"], "c")
+        self.assertEqual(h_c["tag"], "20261118-win")
+
+        h_c_did = plan.new_handoff(p, self.cfg3, transport="bundle", today=d, to_id="dev_c")
+        self.assertEqual(h_c_did["to"], "c")
+
+        # Same-OS source (b -> c) uses disambiguated os_slug in tag
+        p_b = make_project(device="b", paths={"a": "D:\\p", "b": "/Users/b/p", "c": "/Users/c/p"}, dirty=0)
+        h_b_to_c = plan.new_handoff(p_b, self.cfg3, today=d, to_id="c")
+        self.assertEqual(h_b_to_c["tag"], "20261118-mac-b")
+        self.assertEqual(h_b_to_c["to"], "c")
+
+        # Plan generation routes to target c's path & drop dir
+        p_b["handoff"] = h_b_to_c
+        pl = plan.plan_for(p_b, self.cfg3)
+        self.assertEqual(pl["F"]["id"], "b")
+        self.assertEqual(pl["T"]["id"], "c")
+        self.assertIn('cd "/Users/c/p"', block(pl["post"], "从 bundle 取回")["lines"])
+        self.assertIn('git bundle verify "/Users/c/drop/animal-sim-20261118-mac-b.bundle"',
+                      block(pl["post"], "从 bundle 取回")["lines"])
+
+        # Unknown or self to_id raises error
+        with self.assertRaises(LookupError):
+            plan.new_handoff(p, self.cfg3, today=d, to_id="nope")
+        with self.assertRaises(ValueError):
+            plan.new_handoff(p, self.cfg3, today=d, to_id="a")
+
+        # Single-device config cannot create handoff
+        cfg1 = {"devices": [self.cfg3["devices"][0]], "reg": {}}
+        with self.assertRaises(LookupError):
+            plan.new_handoff(p, cfg1, today=d)
+
+
 if __name__ == "__main__":
     unittest.main()

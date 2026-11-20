@@ -28,6 +28,8 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from . import validation
+
 
 FORMAT_VERSION = 1
 
@@ -77,6 +79,31 @@ _GIT_PRIVATE_KEY_REGEX = "-----BEGIN ([A-Z0-9 ]+ )?PRIVATE KEY-----"
 
 class PackageError(Exception):
     """Base error for packaging, verification, path safety, and unpacking."""
+
+
+class UnsafePayloadPathError(PackageError, validation.PathEscapeError):
+    """A verified payload would write outside the target or through a symlink (code ``path_escape``)."""
+
+
+def _safe_dest(target_path: str, rel_p: str) -> str:
+    """Destination for one payload entry: inside target_path, never via a symlinked directory."""
+    try:
+        return validation.safe_join(target_path, rel_p, field="payload")
+    except validation.PathEscapeError as e:
+        raise UnsafePayloadPathError("安全校验失败：%s" % e.message, code=e.code, field=e.field)
+
+
+def _restore_entry(blob_src: str, target_path: str, rel_p: str, git_mode_str: str) -> None:
+    """Write one payload entry after checking its destination and, for symlinks, the link target."""
+    dest_p = _safe_dest(target_path, rel_p)
+    if git_mode_str == "120000":
+        with open(blob_src, "rb") as fh:
+            link_target = fh.read().decode("utf-8", errors="replace")
+        try:
+            validation.check_symlink_target(rel_p, link_target, field="payload")
+        except validation.PathEscapeError as e:
+            raise UnsafePayloadPathError("安全校验失败：%s" % e.message, code=e.code, field=e.field)
+    _write_restored_file(blob_src, dest_p, git_mode_str)
 
 
 class SecretLeakError(PackageError):
@@ -934,7 +961,7 @@ def build_payload(
         target_os_norm = "windows"
 
     check_case = target_os_norm in ("windows", "mac")
-    check_windows = (target_os_norm == "windows") or (os.name == "nt")
+    check_windows = target_os_norm == "windows"
 
     meta_out = dict(metadata or {})
     meta_out.setdefault("lastTask", "")
@@ -1330,6 +1357,7 @@ def build_payload(
 
     return {
         "mode": mode_str,
+        "targetOs": target_os_norm,
         "branch": branch,
         "headCommit": head_commit,
         "stagedCount": len(staged_entries),
@@ -1342,6 +1370,49 @@ def build_payload(
 
 
 # ---------------------------------------------------------------- 3. Extract & Verify Payload
+
+
+def _check_manifest_entry_paths(manifest: Dict[str, Any], real_staging: str) -> None:
+    """Static containment check of every entry a receiver would write, before anything is cached.
+
+    Symlink entries must point inside the project, and no written entry may sit
+    beneath a symlink entry of the same payload (that write would land wherever
+    the link points).
+    """
+    links: Set[str] = set()
+    written: List[str] = []
+    for key in ("stagedEntries", "unstagedEntries", "untrackedEntries", "folderEntries"):
+        entries = manifest.get(key) or []
+        if not isinstance(entries, list):
+            raise UnsafePayloadPathError("安全校验失败：payload_manifest.json 的 %s 不是列表。" % key)
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise UnsafePayloadPathError("安全校验失败：payload_manifest.json 的 %s 条目损坏。" % key)
+            try:
+                rel = validation.normalize_rel_path(entry.get("path"), field="payload")
+            except validation.PathEscapeError as e:
+                raise UnsafePayloadPathError("安全校验失败：%s" % e.message, code=e.code, field=e.field)
+            if entry.get("status") == "D":
+                continue
+            written.append(rel)
+            if entry.get("mode") == "120000":
+                member = _normalize_rel_path(str(entry.get("archiveMember") or ""))
+                with open(os.path.join(real_staging, *member.split("/")), "rb") as fh:
+                    link_target = fh.read().decode("utf-8", errors="replace")
+                try:
+                    validation.check_symlink_target(rel, link_target, field="payload")
+                except validation.PathEscapeError as e:
+                    raise UnsafePayloadPathError("安全校验失败：%s" % e.message, code=e.code, field=e.field)
+                links.add(rel)
+    for rel in written:
+        parts = rel.split("/")
+        for depth in range(1, len(parts)):
+            if "/".join(parts[:depth]) in links:
+                raise UnsafePayloadPathError(
+                    "安全校验失败：交接载荷在符号链接 %s 之下写入 %s。" % ("/".join(parts[:depth]), rel),
+                    code="symlink_in_path",
+                    field="payload",
+                )
 
 
 def extract_and_verify_payload(tar_gz_path: str, staging_dir: str) -> Dict[str, Any]:
@@ -1426,6 +1497,8 @@ def extract_and_verify_payload(tar_gz_path: str, staging_dir: str) -> Dict[str, 
             raise PackageError(
                 "交接载荷文件校验失败（SHA-256 或大小不匹配）：%s" % rel_norm
             )
+
+    _check_manifest_entry_paths(manifest, real_staging)
 
     def _load_json_dict(name: str) -> Dict[str, Any]:
         p = os.path.join(real_staging, name)
@@ -1653,8 +1726,14 @@ def check_target_clean_for_receive(
     payload_manifest: dict,
     expected_base_head: Optional[str] = None,
     expected_folder_hashes: Optional[dict] = None,
+    preserve_ignored: bool = False,
 ) -> None:
     """Verify cross-OS path safety and ensure target_path has no unsynced local changes.
+
+    `preserve_ignored=True` is for the transactional receive, which keeps Git-ignored
+    files in place as preservedEntries and refuses paths that collide with them
+    (`workspace_tx`). Such files then do not block. The default keeps refusing them,
+    because a raw `apply_verified_payload` removes them.
 
     Never mutates target_path.
     """
@@ -1701,15 +1780,16 @@ def check_target_clean_for_receive(
             incoming_has_commits = bool(payload_manifest.get("hasCommits"))
             incoming_head = payload_manifest.get("headCommit") or ""
 
-            rc_ignored, ignored_paths, ignored_error = _run_git_bytes(
-                target_path, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"]
-            )
-            if rc_ignored != 0:
-                reasons.append("无法检查目标仓库的忽略文件：%s" % ignored_error.decode("utf-8", errors="replace").strip())
-            else:
-                for path in _parse_nul_paths(ignored_paths):
-                    if not (_is_secret_filename(path) and not os.path.isdir(os.path.join(target_path, path))):
-                        reasons.append("存在本机 Git 忽略文件：%s" % path)
+            if not preserve_ignored:
+                rc_ignored, ignored_paths, ignored_error = _run_git_bytes(
+                    target_path, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"]
+                )
+                if rc_ignored != 0:
+                    reasons.append("无法检查目标仓库的忽略文件：%s" % ignored_error.decode("utf-8", errors="replace").strip())
+                else:
+                    for path in _parse_nul_paths(ignored_paths):
+                        if not (_is_secret_filename(path) and not os.path.isdir(os.path.join(target_path, path))):
+                            reasons.append("存在本机 Git 忽略文件：%s" % path)
 
             staging = payload_manifest.get("_stagingDir")
             if incoming_has_commits and staging:
@@ -1974,7 +2054,7 @@ def apply_verified_payload(staging_dir: str, target_path: str) -> Dict[str, Any]
         # Apply exact staged index state + matching working-tree baseline
         for entry in manifest.get("stagedEntries") or []:
             rel_p = _normalize_rel_path(entry["path"])
-            dest_p = os.path.join(target_path, *rel_p.split("/"))
+            dest_p = _safe_dest(target_path, rel_p)
             if entry.get("status") == "D":
                 rc_rm, _, err_rm = _run_git_text(
                     target_path,
@@ -2001,12 +2081,12 @@ def apply_verified_payload(staging_dir: str, target_path: str) -> Dict[str, Any]
                 )
                 if rc_ui != 0:
                     raise PackageError("更新暂存索引失败（%s）：%s" % (rel_p, err_ui.strip()))
-                _write_restored_file(blob_src, dest_p, entry_mode)
+                _restore_entry(blob_src, target_path, rel_p, entry_mode)
 
         # Apply exact unstaged working-tree modifications / deletions without touching index
         for entry in manifest.get("unstagedEntries") or []:
             rel_p = _normalize_rel_path(entry["path"])
-            dest_p = os.path.join(target_path, *rel_p.split("/"))
+            dest_p = _safe_dest(target_path, rel_p)
             if entry.get("status") == "D":
                 if os.path.lexists(dest_p) and not _is_secret_filename(rel_p):
                     os.unlink(dest_p)
@@ -2014,17 +2094,17 @@ def apply_verified_payload(staging_dir: str, target_path: str) -> Dict[str, Any]
             else:
                 blob_src = os.path.join(staging_dir, *_normalize_rel_path(entry["archiveMember"]).split("/"))
                 entry_mode = entry.get("mode") or "100644"
-                _write_restored_file(blob_src, dest_p, entry_mode)
+                _restore_entry(blob_src, target_path, rel_p, entry_mode)
 
         # Restore eligible untracked files
         for entry in manifest.get("untrackedEntries") or []:
             rel_p = _normalize_rel_path(entry["path"])
             if _is_secret_filename(rel_p):
                 continue
-            dest_p = os.path.join(target_path, *rel_p.split("/"))
+            dest_p = _safe_dest(target_path, rel_p)
             blob_src = os.path.join(staging_dir, *_normalize_rel_path(entry["archiveMember"]).split("/"))
             entry_mode = entry.get("mode") or "100644"
-            _write_restored_file(blob_src, dest_p, entry_mode)
+            _restore_entry(blob_src, target_path, rel_p, entry_mode)
 
         # Refresh Git stat cache so clean files don't show mtime-only diffs
         _run_git_text(target_path, ["update-index", "-q", "--refresh"])
@@ -2044,10 +2124,10 @@ def apply_verified_payload(staging_dir: str, target_path: str) -> Dict[str, Any]
         rel_p = _normalize_rel_path(entry["path"])
         if _is_secret_filename(rel_p):
             continue
-        dest_p = os.path.join(target_path, *rel_p.split("/"))
+        dest_p = _safe_dest(target_path, rel_p)
         blob_src = os.path.join(staging_dir, *_normalize_rel_path(entry["archiveMember"]).split("/"))
         entry_mode = entry.get("mode") or "100644"
-        _write_restored_file(blob_src, dest_p, entry_mode)
+        _restore_entry(blob_src, target_path, rel_p, entry_mode)
         restored_hashes[rel_p] = entry["sha256"]
 
     return {

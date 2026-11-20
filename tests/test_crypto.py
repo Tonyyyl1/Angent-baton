@@ -490,5 +490,159 @@ class TestEncryptedMetadataPreview(CryptoTestBase):
             C.decrypt_meta(bad_recip_env, ident_a, desc_b)
 
 
+class TestKeyRotationV3DescriptorAndSnapshots(CryptoTestBase):
+    def test_rotate_identity_keys_preserves_device_id_and_perms(self):
+        missing_home = self.dir / "missing_home"
+        with self.assertRaises(C.CryptoError):
+            C.rotate_identity_keys(missing_home)
+
+        home_a = self.dir / "home_rot"
+        orig = C.ensure_identity(
+            home_a,
+            alias="mac-main",
+            name="Mac Studio",
+            os_name="mac",
+            host="studio.local",
+        )
+        ident_file = home_a / "identity.json"
+        if os.name != "nt":
+            os.chmod(ident_file, 0o644)
+
+        rotated = C.rotate_identity_keys(home_a)
+        self.assertEqual(rotated["deviceId"], orig["deviceId"])
+        self.assertEqual(rotated["alias"], "mac-main")
+        self.assertEqual(rotated["name"], "Mac Studio")
+        self.assertEqual(rotated["os"], "mac")
+        self.assertEqual(rotated["host"], "studio.local")
+        self.assertEqual(rotated["createdAt"], orig["createdAt"])
+        self.assertTrue(rotated.get("rotatedAt", "").endswith("Z"))
+
+        for key_field in ("signPrivateKey", "verifyPublicKey", "boxPrivateKey", "boxPublicKey"):
+            self.assertNotEqual(rotated[key_field], orig[key_field])
+            self.assertEqual(len(base64.b64decode(rotated[key_field])), 32)
+        self.assertNotEqual(rotated["keyFingerprint"], orig["keyFingerprint"])
+        self.assertEqual(
+            rotated["keyFingerprint"],
+            C.device_fingerprint(rotated["verifyPublicKey"], rotated["boxPublicKey"]),
+        )
+
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(ident_file.stat().st_mode), 0o600)
+
+        reloaded = C.ensure_identity(home_a)
+        self.assertEqual(reloaded["signPrivateKey"], rotated["signPrivateKey"])
+        self.assertEqual(reloaded["boxPublicKey"], rotated["boxPublicKey"])
+
+    def test_public_descriptor_v3_and_v2_interop(self):
+        home_a = self.dir / "v3_a"
+        home_b = self.dir / "v3_b"
+        ident_a = C.ensure_identity(home_a, alias="a", name="A", os_name="windows")
+        ident_b = C.ensure_identity(home_b, alias="b", name="B", os_name="mac")
+
+        desc_v2 = C.public_descriptor(ident_a)
+        self.assertEqual(set(desc_v2.keys()), set(C.PUBLIC_DESCRIPTOR_FIELDS))
+
+        desc_v3 = C.public_descriptor_v3(ident_a)
+        self.assertEqual(desc_v3["protocolVersion"], 3)
+        self.assertEqual(desc_v3["capabilities"], ["v2", "v3"])
+        self.assertNotIn("rotatedAt", desc_v3)
+        self.assertNotIn("signPrivateKey", desc_v3)
+        self.assertNotIn("boxPrivateKey", desc_v3)
+
+        rotated_a = C.rotate_identity_keys(home_a)
+        desc_v3_rot = C.public_descriptor_v3(rotated_a, capabilities=["v3"])
+        self.assertEqual(desc_v3_rot["capabilities"], ["v3"])
+        self.assertEqual(desc_v3_rot["rotatedAt"], rotated_a["rotatedAt"])
+
+        # verify_json and pair_fingerprint work identically across v2/v3 descriptors
+        signed_v3 = C.sign_json(desc_v3_rot, rotated_a["signPrivateKey"])
+        verified_v3 = C.verify_json(
+            signed_v3,
+            rotated_a["verifyPublicKey"],
+            expected_device_id=rotated_a["deviceId"],
+        )
+        self.assertEqual(verified_v3, desc_v3_rot)
+
+        desc_b_v2 = C.public_descriptor(ident_b)
+        desc_b_v3 = C.public_descriptor_v3(ident_b)
+        self.assertEqual(
+            C.pair_fingerprint(desc_v3_rot, desc_b_v2),
+            C.pair_fingerprint(C.public_descriptor(rotated_a), desc_b_v3),
+        )
+
+    def test_sign_and_verify_snapshot_including_tamper_and_forgery(self):
+        ident_a = C.ensure_identity(self.dir / "snap_a", alias="a")
+        ident_b = C.ensure_identity(self.dir / "snap_b", alias="b")
+        ident_c = C.ensure_identity(self.dir / "snap_c", alias="c")
+
+        sha = hashlib.sha256(b"payload-bytes").hexdigest()
+        snap = {
+            "projectId": "p_multi01",
+            "versionId": "snap_20261118_abcd1234",
+            "contentSha256": sha,
+            "parentVersionIds": ["snap_20261117_00001111"],
+            "note": "跨机接力快照",
+        }
+        snap_before = json.loads(json.dumps(snap))
+
+        signed = C.sign_snapshot(snap, ident_a["signPrivateKey"], ident_a["deviceId"])
+        self.assertEqual(snap, snap_before)  # input not mutated
+        self.assertEqual(signed["authorDeviceId"], ident_a["deviceId"])
+        self.assertEqual(signed["signerDeviceId"], ident_a["deviceId"])
+        self.assertEqual(signed["formatVersion"], 3)
+        self.assertIn("signature", signed)
+
+        verified = C.verify_snapshot(
+            signed, ident_a["verifyPublicKey"], expected_author_id=ident_a["deviceId"]
+        )
+        self.assertEqual(verified["projectId"], "p_multi01")
+        self.assertEqual(verified["contentSha256"], sha)
+        self.assertNotIn("signature", verified)
+
+        # 1. Forwarder tampers contentSha256 or parentVersionIds
+        tampered_sha = dict(signed, contentSha256="0" * 64)
+        with self.assertRaises(C.TamperError):
+            C.verify_snapshot(tampered_sha, ident_a["verifyPublicKey"])
+
+        tampered_parent = dict(signed, parentVersionIds=[])
+        with self.assertRaises(C.TamperError):
+            C.verify_snapshot(tampered_parent, ident_a["verifyPublicKey"])
+
+        # 2. Forwarder forges authorDeviceId without re-signing
+        forged_author = dict(signed, authorDeviceId=ident_c["deviceId"])
+        with self.assertRaises(C.TamperError):
+            C.verify_snapshot(forged_author, ident_a["verifyPublicKey"])
+
+        # 3. Forwarder B re-signs with B's key while leaving authorDeviceId=A
+        resigned_mismatch = C.sign_json(
+            dict(signed, authorDeviceId=ident_a["deviceId"]),
+            ident_b["signPrivateKey"],
+            signer_device_id=ident_b["deviceId"],
+        )
+        with self.assertRaises(C.TamperError):
+            C.verify_snapshot(resigned_mismatch, ident_b["verifyPublicKey"])
+
+        # 4. Forwarder B re-signs pretending to be B, rejected when expected_author_id=A
+        forged_as_b = C.sign_snapshot(snap, ident_b["signPrivateKey"], ident_b["deviceId"])
+        with self.assertRaises(C.TamperError):
+            C.verify_snapshot(
+                forged_as_b,
+                ident_b["verifyPublicKey"],
+                expected_author_id=ident_a["deviceId"],
+            )
+
+        # 5. Wrong public key
+        with self.assertRaises(C.TamperError):
+            C.verify_snapshot(signed, ident_b["verifyPublicKey"])
+
+        # 6. Invalid snapshot fields rejected on sign
+        with self.assertRaises(C.CryptoError):
+            C.sign_snapshot(
+                {"projectId": "p1", "versionId": "v1", "contentSha256": "not-sha"},
+                ident_a["signPrivateKey"],
+                ident_a["deviceId"],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

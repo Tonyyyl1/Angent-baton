@@ -1,0 +1,3 @@
+# Acceptance run output never belongs in the source digest.
+results/
+__pycache__/

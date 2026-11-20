@@ -19,8 +19,11 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
+from relaydesk import devices as _devices
+from relaydesk import validation as _validation
+
 APP = "relaydesk"
-VERSION = 1
+VERSION = 2
 
 LOCK_WAIT = 5.0    # seconds to wait for the lock
 LOCK_STALE = 30.0  # a lock file older than this is considered left over
@@ -28,6 +31,17 @@ LOCK_STALE = 30.0  # a lock file older than this is considered left over
 
 class LedgerError(Exception):
     """Ledger file cannot be read, written or locked (CLI exit code 2)."""
+
+
+class LocalConfigCorruptError(LedgerError, _validation.LocalStateCorruptError):
+    """config.json exists but cannot be used (code ``local_state_corrupted``)."""
+
+    def __init__(self, message, path=""):
+        _validation.LocalStateCorruptError.__init__(self, message, path=path, kind="config")
+
+
+class _LedgerDeviceConflictError(LedgerError, _devices.DeviceConflictError):
+    """Conflict in ledger config['devices'] (satisfies both LedgerError and DeviceConflictError)."""
 
 
 def tool_dir():
@@ -59,8 +73,8 @@ def _norm_os(val, default_os):
 def default_config():
     return {
         "devices": [
-            {"id": "a", "name": "设备 A", "os": "windows", "drop": "", "host": ""},
-            {"id": "b", "name": "设备 B", "os": "mac", "drop": "", "host": ""},
+            {"id": "a", "name": "设备 A", "os": "windows", "drop": "", "host": "", "deviceId": ""},
+            {"id": "b", "name": "设备 B", "os": "mac", "drop": "", "host": "", "deviceId": ""},
         ],
         "reg": {},
     }
@@ -71,15 +85,62 @@ def norm_config(c):
     c = c if isinstance(c, dict) else {}
     out = dict(c)
     devs = c.get("devices")
-    if isinstance(devs, list) and len(devs) == 2:
+    if isinstance(devs, list) and len(devs) >= 1:
         merged = []
+        seen_ids = set()
+        seen_dids = set()
+        seen_names = set()
         for i, x in enumerate(devs):
-            m = dict(d["devices"][i])
-            if isinstance(x, dict):
-                m.update(x)
-            if not m.get("id"):
-                m["id"] = d["devices"][i]["id"]
-            m["os"] = _norm_os(m.get("os"), d["devices"][i]["os"])
+            if not isinstance(x, dict):
+                raise LedgerError("台账配置里的设备条目不是对象。")
+            raw_id = str(x.get("id") or "").strip()
+            if i < 2 and (not raw_id or raw_id == d["devices"][i]["id"]):
+                base = dict(d["devices"][i])
+            else:
+                fallback_id = raw_id or ("dev%d" % (i + 1))
+                base = {
+                    "id": fallback_id,
+                    "name": x.get("name") if "name" in x else ("设备 %s" % fallback_id),
+                    "os": "linux",
+                    "drop": "",
+                    "host": "",
+                    "deviceId": "",
+                }
+            m = dict(base)
+            m.update(x)
+            m["id"] = str(m.get("id") or "").strip() or base["id"]
+            m["name"] = str(m.get("name") or "")
+            m["os"] = _norm_os(m.get("os"), base["os"])
+            m["drop"] = str(m.get("drop") or "")
+            m["host"] = str(m.get("host") or "")
+            m["deviceId"] = str(m.get("deviceId") or "")
+
+            id_key = m["id"].lower()
+            if id_key in seen_ids:
+                raise _LedgerDeviceConflictError(
+                    "台账配置中存在重复的设备别名「%s」。" % m["id"],
+                    code="alias_conflict",
+                )
+            seen_ids.add(id_key)
+
+            did_key = m["deviceId"].strip()
+            if did_key:
+                if did_key in seen_dids:
+                    raise _LedgerDeviceConflictError(
+                        "台账配置中存在重复的 deviceId「%s」。" % did_key,
+                        code="device_id_conflict",
+                    )
+                seen_dids.add(did_key)
+
+            name_key = m["name"].strip().lower()
+            if name_key:
+                if name_key in seen_names:
+                    raise _LedgerDeviceConflictError(
+                        "台账配置中存在重复的设备名称「%s」。" % m["name"],
+                        code="name_conflict",
+                    )
+                seen_names.add(name_key)
+
             merged.append(m)
         out["devices"] = merged
     else:
@@ -117,6 +178,8 @@ def norm_project(p, config):
     }
     n.update(p)
     n["paths"] = _dict_or_empty(p.get("paths"))
+    if "pathsByDeviceId" in p:
+        n["pathsByDeviceId"] = _dict_or_empty(p.get("pathsByDeviceId"))
     v = {"state": "none", "cmd": "", "note": ""}
     v.update(_dict_or_empty(p.get("verify")))
     n["verify"] = v
@@ -260,10 +323,28 @@ class _Lock(object):
 
 def update(path, fn):
     """Lock, load, apply fn(ledger) in place, save, unlock. Returns the saved ledger."""
+    p = Path(path)
     with _Lock(path):
+        existed = p.exists()
+        raw_version = None
+        if existed:
+            try:
+                with open(p, "r", encoding="utf-8-sig") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    raw_version = raw.get("version")
+            except (OSError, ValueError, UnicodeDecodeError):
+                raw_version = None
         ledger = load(path)
         fn(ledger)
+        ledger["version"] = VERSION
         ledger = _normalize(ledger)
+        if existed and (
+            isinstance(raw_version, bool)
+            or not isinstance(raw_version, int)
+            or raw_version < VERSION
+        ):
+            _devices.ensure_backup_once(p, Path(str(p) + ".v1.backup.json"))
         save(path, ledger)
         return ledger
 
@@ -450,10 +531,13 @@ def dev(config, dev_id):
 
 
 def other(config, dev_id):
-    for d in config["devices"]:
+    devices = config["devices"]
+    for d in devices:
         if d["id"] != dev_id:
             return d
-    return config["devices"][1]
+    if len(devices) > 1:
+        return devices[1]
+    return devices[0]
 
 
 # ---------------------------------------------------------------- local config
@@ -466,13 +550,30 @@ def local_dir():
 
 
 def load_local():
+    """This machine's config.json: ``{}`` if never created, LedgerError if present but unreadable.
+
+    A damaged file must not silently fall back to ``{}``: the ledger path would
+    then default to the tool directory and later writes would go to the wrong
+    ledger.
+    """
     f = local_dir() / "config.json"
+    if not os.path.lexists(str(f)):
+        return {}
     try:
         with open(str(f), "r", encoding="utf-8-sig") as fh:
             d = json.load(fh)
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    except (OSError, ValueError) as e:
+        raise LocalConfigCorruptError(
+            "本机设备配置 %s 已损坏或无法读取（%s）。为避免写错台账，操作已停止；"
+            "请修复该文件，或备份后移走它再重新运行 relay init。" % (f, e),
+            path=str(f),
+        )
+    if not isinstance(d, dict):
+        raise LocalConfigCorruptError(
+            "本机设备配置 %s 格式不对（顶层不是对象）。请修复该文件，或备份后移走它再重新运行 relay init。" % f,
+            path=str(f),
+        )
+    return d
 
 
 def save_local(d):
@@ -531,26 +632,32 @@ def here(ledger, local=None):
     devices = ledger["config"]["devices"]
     ids = [d["id"] for d in devices]
     env = os.environ.get("RELAY_DESK_DEVICE")
-    if env and env in ids:
-        return env
-    local_was_none = local is None
-    local = load_local() if local_was_none else local
-    if local.get("device") in ids:
-        return local["device"]
-    local_dev_id = local.get("deviceId")
+    if env:
+        env_s = env.strip()
+        if env_s in ids:
+            return env_s
+        by_env_did = [d for d in devices if d.get("deviceId") == env_s]
+        if len(by_env_did) == 1:
+            return by_env_did[0]["id"]
+        by_env_ci = [d for d in devices if d["id"].lower() == env_s.lower()]
+        if len(by_env_ci) == 1:
+            return by_env_ci[0]["id"]
+    local_cfg = load_local() if local is None else local
+    local_dev_id = local_cfg.get("deviceId")
     if local_dev_id:
         by_did = [d for d in devices if d.get("deviceId") == local_dev_id]
         if len(by_did) == 1:
             return by_did[0]["id"]
-    if local_was_none:
-        ident = _load_identity()
-        ident_did = ident.get("deviceId")
-        if ident_did:
-            by_did = [d for d in devices if d.get("deviceId") == ident_did]
-            if len(by_did) == 1:
-                return by_did[0]["id"]
-        if ident.get("alias") in ids:
-            return ident["alias"]
+    if local_cfg.get("device") in ids:
+        return local_cfg["device"]
+    ident = _load_identity()
+    ident_did = ident.get("deviceId")
+    if ident_did:
+        by_did = [d for d in devices if d.get("deviceId") == ident_did]
+        if len(by_did) == 1:
+            return by_did[0]["id"]
+    if ident.get("alias") in ids:
+        return ident["alias"]
     host = hostname().lower()
     short = host.split(".")[0]
     host_match = []

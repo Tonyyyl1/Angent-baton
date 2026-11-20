@@ -1,0 +1,46 @@
+{
+ "schema": "relay-desk-acceptance-steps/1",
+ "name": "loopback-2device",
+ "description": "Two isolated relay instances on ONE native machine (used by native_runner.py). Exercises this OS's filesystem, locks, process kill recovery and file-in-use replacement through the real CLI. Native OS evidence, not multi-device evidence.",
+ "roles": {
+  "a": {"alias": "loop-a", "system": "", "osLabel": ""},
+  "b": {"alias": "loop-b", "system": "", "osLabel": ""}
+ },
+ "projects": {
+  "loop-git": {"name": "Loopback Git", "kind": "git"},
+  "loop-folder": {"name": "Loopback Folder", "kind": "plain"}
+ },
+ "steps": [
+  {"id": "L01", "phase": "pair", "role": "a", "action": "setup", "title": "初始化实例 a"},
+  {"id": "L02", "phase": "pair", "role": "b", "action": "setup", "title": "初始化实例 b"},
+  {"id": "L03", "phase": "pair", "role": "a", "action": "pair-accept", "peer": "b", "title": "a 核对指纹后确认 b"},
+  {"id": "L04", "phase": "pair", "role": "b", "action": "pair-accept", "peer": "a", "title": "b 核对指纹后确认 a"},
+  {"id": "L05", "phase": "relay", "role": "a", "action": "make-fixture", "project": "loop-git", "title": "a 生成合成 Git 项目"},
+  {"id": "L06", "phase": "relay", "role": "a", "action": "send", "project": "loop-git", "to": "b", "title": "a 交棒给 b"},
+  {"id": "L07", "phase": "relay", "role": "b", "action": "receive", "project": "loop-git", "from": "a", "target": "new", "title": "b 接棒到新目录（本机文件系统、Unicode、执行位）"},
+  {"id": "L08", "phase": "relay", "role": "b", "action": "edit", "project": "loop-git", "round": 1, "title": "b 继续开发"},
+  {"id": "L09", "phase": "relay", "role": "b", "action": "send", "project": "loop-git", "to": "a", "title": "b 交棒回 a"},
+  {"id": "L10", "phase": "relay", "role": "a", "action": "receive", "project": "loop-git", "from": "b", "target": "into", "adoptInto": true, "title": "a 接棒到新目录（原目录有忽略文件，见 R10）"},
+  {"id": "L11", "phase": "crash", "role": "a", "action": "edit", "project": "loop-git", "round": 2, "title": "a 继续开发"},
+  {"id": "L12", "phase": "crash", "role": "a", "action": "send", "project": "loop-git", "to": "b", "title": "a 交棒给 b"},
+  {"id": "L13", "phase": "crash", "role": "b", "action": "receive", "project": "loop-git", "from": "a", "target": "existing", "fault": {"point": "tx_mid_files", "mode": "sigkill"}, "expect": "killed", "assertNoReceipt": true, "title": "b 写文件中途进程被杀（本机进程退出语义）"},
+  {"id": "L14", "phase": "crash", "role": "b", "action": "recover", "relayFromStep": "L13", "mode": "status", "expectCanResume": true, "title": "b 查看恢复事务"},
+  {"id": "L15", "phase": "crash", "role": "b", "action": "receive", "project": "loop-git", "relayFromStep": "L13", "target": "existing", "title": "b 重启后完成接棒"},
+  {"id": "L16", "phase": "file-in-use", "role": "b", "action": "edit", "project": "loop-git", "round": 3, "title": "b 继续开发"},
+  {"id": "L17", "phase": "file-in-use", "role": "b", "action": "send", "project": "loop-git", "to": "a", "title": "b 交棒给 a"},
+  {"id": "L18", "phase": "file-in-use", "role": "a", "action": "receive-while-file-open", "project": "loop-git", "from": "b", "holdFile": "src/app.py", "title": "a 接棒时另一进程占用工作区文件（Windows 文件占用与替换）"},
+  {"id": "L19", "phase": "folder", "role": "a", "action": "make-fixture", "project": "loop-folder", "title": "a 生成合成普通目录"},
+  {"id": "L20", "phase": "folder", "role": "a", "action": "send", "project": "loop-folder", "to": "b", "title": "a 交棒普通目录给 b"},
+  {"id": "L21", "phase": "folder", "role": "b", "action": "receive", "project": "loop-folder", "from": "a", "target": "new", "title": "b 接棒普通目录"},
+  {"id": "L22", "phase": "converge", "role": "a", "action": "converge", "title": "a 同步并记录状态"},
+  {"id": "L23", "phase": "converge", "role": "b", "action": "converge", "title": "b 同步并记录状态"}
+ ],
+ "scenarios": {
+  "pairing": ["L01", "L02", "L03", "L04"],
+  "git-roundtrip": ["L05", "L06", "L07", "L08", "L09", "L10"],
+  "process-kill-recovery": ["L11", "L12", "L13", "L14", "L15"],
+  "file-in-use-replacement": ["L16", "L17", "L18"],
+  "plain-folder": ["L19", "L20", "L21"],
+  "converge": ["L22", "L23"]
+ }
+}

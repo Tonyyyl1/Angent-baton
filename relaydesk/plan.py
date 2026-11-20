@@ -75,6 +75,10 @@ def dev(config, dev_id):
     for d in devs:
         if d.get("id") == dev_id:
             return d
+    if dev_id:
+        for d in devs:
+            if d.get("deviceId") == dev_id:
+                return d
     return devs[0]
 
 
@@ -83,7 +87,7 @@ def other(config, dev_id):
     for d in devs:
         if d.get("id") != dev_id:
             return d
-    return devs[1]
+    return devs[0]
 
 
 def is_win(d):
@@ -95,9 +99,12 @@ def shell_of(d):
 
 
 def os_slug(d, config):
-    o = other(config, d["id"])
     s = "win" if is_win(d) else ("mac" if d.get("os") == "mac" else "linux")
-    return s + "-" + d["id"] if o.get("os") == d.get("os") else s
+    same_os_exists = any(
+        x.get("id") != d.get("id") and x.get("os") == d.get("os")
+        for x in config["devices"]
+    )
+    return s + "-" + d["id"] if same_os_exists else s
 
 
 def join_p(d, base, name):
@@ -179,22 +186,37 @@ def _verify_label(state):
 
 # ---------------------------------------------------------------- tiers
 
-def tier_board(project, config):
+def tier_board(project, config, to_id=None):
     p = project
     frm = dev(config, p["device"])
-    to = other(config, p["device"])
+    if to_id:
+        to = dev(config, to_id)
+    elif isinstance(p.get("handoff"), dict) and p["handoff"].get("to"):
+        to = dev(config, p["handoff"]["to"])
+    elif len([d for d in config["devices"] if d.get("id") != frm["id"]]) == 1:
+        to = other(config, frm["id"])
+    else:
+        to = None
     B = {"native": [], "git": [], "extra": [], "manual": []}
     for s in p.get("sessions") or []:
         t = TOOL_LABEL.get(s.get("tool"), "Claude Code")
         name = s.get("title") or s.get("sessionId") or "未命名 Session"
         kind = s.get("kind")
+        s_dev_raw = s.get("device")
+        s_in_cfg = any(
+            d.get("id") == s_dev_raw or (s_dev_raw and d.get("deviceId") == s_dev_raw)
+            for d in config["devices"]
+        )
+        s_dev = dev(config, s_dev_raw) if s_in_cfg else None
         if kind == "cloud":
             B["native"].append([t + " 云端 Session", name, False])
         elif kind == "remote":
             B["native"].append([t + " Remote Control",
-                                name + "。仍在 " + dev(config, s.get("device"))["name"] + " 上运行，那台设备要开着", False])
-        elif s.get("device") == to["id"]:
+                                name + "。仍在 " + dev(config, s_dev_raw)["name"] + " 上运行，那台设备要开着", False])
+        elif to is not None and s_dev is not None and s_dev["id"] == to["id"]:
             B["native"].append([t + " 本地 Session", name + "。本来就在 " + to["name"], False])
+        elif to is None and s_dev is not None and s_dev["id"] != frm["id"]:
+            B["native"].append([t + " 本地 Session", name + "。本来就在 " + s_dev["name"], False])
         elif s.get("carry") == "transcript":
             if s.get("tool") == "anti":
                 B["extra"].append(["Antigravity 本地会话的 brain 目录", name + "。搬运产物与转录供查阅，非官方做法", False])
@@ -228,16 +250,18 @@ def tier_board(project, config):
 def session_tiers(session, config):
     s = session
     home = dev(config, s.get("device"))
-    oth = other(config, s.get("device"))
+    others = [d for d in config["devices"] if d.get("id") != home["id"]]
     kind = s.get("kind")
     if kind == "cloud":
-        return [["两台设备", "native", ""]]
+        return [["两台设备" if len(config["devices"]) == 2 else "全部已登录设备", "native", ""]]
     if kind == "remote":
-        return [[home["name"], "native", "在这里运行"], [oth["name"], "native", "远程操作"]]
+        return [[home["name"], "native", "在这里运行"]] + [[o["name"], "native", "远程操作"] for o in others]
     tx = s.get("carry") == "transcript"
     extra_note = "搬运 brain 目录供查阅，非官方" if s.get("tool") == "anti" else "搬运转录，非官方"
-    return [[home["name"], "native", ""],
-            [oth["name"], "extra" if tx else "manual", extra_note if tx else "读摘要开新 Session"]]
+    return [[home["name"], "native", ""]] + [
+        [o["name"], "extra" if tx else "manual", extra_note if tx else "读摘要开新 Session"]
+        for o in others
+    ]
 
 
 def resume_lines(project, session):
@@ -275,10 +299,26 @@ def default_transport(project):
     return "remote" if p.get("remote") else "bundle"
 
 
-def new_handoff(project, config, transport=None, today=None):
+def new_handoff(project, config, transport=None, today=None, to_id=None):
     c = project
     frm = dev(config, c["device"])
-    to = other(config, c["device"])
+    if to_id:
+        to = next(
+            (d for d in config["devices"] if d.get("id") == to_id or (to_id and d.get("deviceId") == to_id)),
+            None,
+        )
+        if to is None:
+            raise LookupError("找不到目标设备：%s" % to_id)
+        if to.get("id") == frm.get("id"):
+            raise ValueError("目标设备不能与来源设备相同：%s" % to_id)
+    else:
+        others = [d for d in config["devices"] if d.get("id") != frm["id"]]
+        if len(others) == 1:
+            to = others[0]
+        elif len(others) == 0:
+            raise LookupError("台账里还没有其他可接力的目标设备，请先添加或配对设备。")
+        else:
+            raise LookupError("存在多个可用目标设备（%s），请用 --to 明确指定接棒设备。" % "、".join(d["id"] for d in others))
     avail = ["remote", "bundle", "patch"] if c.get("branch") else ["folder"]
     tr = transport or default_transport(c)
     if tr not in avail or (tr == "remote" and not c.get("remote")):

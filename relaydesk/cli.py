@@ -5,6 +5,7 @@ This module never runs a git command and never touches the network.
 """
 import argparse
 import importlib
+import inspect
 import json
 import os
 import re
@@ -13,7 +14,9 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from . import devices
 from . import ledger as L
+from . import validation as V
 
 TOOL = {
     "claude": "Claude Code",
@@ -30,7 +33,7 @@ STATUS = {"active": "进行中", "paused": "暂停", "blocked": "受阻", "done"
 VERIFY = {"none": "未验证", "pass": "通过", "partial": "部分通过", "fail": "未通过"}
 TIER_LABEL = {"native": "原生可恢复", "git": "可通过 Git 同步", "extra": "需要额外同步", "manual": "仅能手动重建"}
 CONFLICT_KIND = ["both", "merge", "instr", "session", "other"]
-NEED_DEVICE = "无法识别本机是哪台设备。请先运行 relay init --device a（或 b）。"
+NEED_DEVICE = "无法识别本机是哪台设备。请先运行 relay init --device a（或 b，或自定义别名）。"
 
 
 class CliError(Exception):
@@ -274,37 +277,128 @@ def run_scan(path, local, ids, with_global=False):
 
 # ---------------------------------------------------------------- commands: setup
 
+def _format_candidates_msg(msg, candidates):
+    if not candidates:
+        return msg
+    parts = []
+    for c in candidates:
+        if not isinstance(c, dict):
+            continue
+        alias = str(c.get("alias") or c.get("id") or "")
+        did = str(c.get("deviceId") or "")
+        name = str(c.get("name") or "")
+        label = alias or name or did or "?"
+        if (did and did not in msg) or (alias and alias not in msg):
+            parts.append("%s（deviceId=%s）" % (label, did or "-"))
+    if parts:
+        return "%s\n候选设备：%s" % (msg, "；".join(parts))
+    return msg
+
+
 def cmd_init(args):
     path, local = ctx()
     changed = False
+    alias = None
+    if args.device is not None:
+        try:
+            alias = devices.validate_alias(args.device)
+        except ValueError as e:
+            raise CliError(str(e), 1)
+        local["device"] = alias
+        changed = True
     if args.ledger:
         local["ledger"] = os.path.abspath(args.ledger)
         changed = True
-    if args.device:
-        local["device"] = args.device
-        changed = True
+
     led_path = L.ledger_path(local)
     existed = led_path.exists()
-    if not existed:
-        L.update(led_path, lambda led: None)
-    led = L.load(led_path)
-    if args.host:
-        h = args.device or L.here(led, local)
-        if not h:
-            raise CliError(NEED_DEVICE, 1)
-        if args.device is None:
+    ident = L._load_identity()
+    ident_did = str(ident.get("deviceId") or "").strip()
+
+    try:
+        if not existed:
+            def init_new(led):
+                if alias and alias not in ("a", "b"):
+                    led["config"]["devices"] = [{
+                        "id": alias,
+                        "name": args.name if args.name is not None else alias,
+                        "os": L.local_os(),
+                        "drop": "",
+                        "host": L.hostname() if args.host else "",
+                        "deviceId": ident_did,
+                    }]
+                elif alias:
+                    d = L.dev(led["config"], alias)
+                    if args.name is not None:
+                        d["name"] = args.name
+                    if args.host:
+                        d["host"] = L.hostname()
+                    if ident_did and not d.get("deviceId"):
+                        d["deviceId"] = ident_did
+                elif args.host:
+                    h = L.here(led, local)
+                    if not h:
+                        raise CliError(NEED_DEVICE, 1)
+                    d = L.dev(led["config"], h)
+                    d["host"] = L.hostname()
+                    if args.name is not None:
+                        d["name"] = args.name
+
+            led = L.update(led_path, init_new)
+        else:
+            def init_existing(led):
+                devs = led["config"]["devices"]
+                if alias:
+                    exact = next((d for d in devs if d.get("id") == alias), None)
+                    if exact is not None:
+                        if args.name is not None:
+                            exact["name"] = args.name
+                        if args.host:
+                            exact["host"] = L.hostname()
+                        if ident_did and not exact.get("deviceId"):
+                            if not any(x.get("deviceId") == ident_did for x in devs):
+                                exact["deviceId"] = ident_did
+                    else:
+                        ci = next((d for d in devs if str(d.get("id") or "").lower() == alias.lower()), None)
+                        if ci is not None:
+                            raise CliError("台账中已存在别名「%s」（与「%s」大小写冲突），请使用一致的别名。" % (ci["id"], alias), 1)
+                        new_name = args.name if args.name is not None else alias
+                        used_dids = {str(x.get("deviceId") or "").strip() for x in devs if x.get("deviceId")}
+                        devs.append({
+                            "id": alias,
+                            "name": new_name,
+                            "os": L.local_os(),
+                            "drop": "",
+                            "host": L.hostname() if args.host else "",
+                            "deviceId": ident_did if (ident_did and ident_did not in used_dids) else "",
+                        })
+                elif args.host:
+                    h = L.here(led, local)
+                    if not h:
+                        raise CliError(NEED_DEVICE, 1)
+                    d = L.dev(led["config"], h)
+                    d["host"] = L.hostname()
+                    if args.name is not None:
+                        d["name"] = args.name
+
+            led = L.update(led_path, init_existing)
+    except devices.DeviceConflictError as e:
+        raise CliError(str(e), 1)
+
+    if args.host and alias is None:
+        h = L.here(led, local)
+        if h and local.get("device") != h:
             local["device"] = h
             changed = True
-
-        def sethost(l):
-            L.dev(l["config"], h)["host"] = L.hostname()
-        led = L.update(led_path, sethost)
+    if ident_did and local.get("deviceId") != ident_did:
+        local["deviceId"] = ident_did
+        changed = True
     if changed or not (L.local_dir() / "config.json").exists():
         L.save_local(local)
     me = L.here(led, local)
     out("已写入本机配置：%s" % (L.local_dir() / "config.json"))
     out("台账：%s%s" % (led_path, "" if existed else "（新建）"))
-    out("本机设备：%s" % (_dev_label(led["config"], me) if me else "尚未确定，请加 --device a 或 --device b"))
+    out("本机设备：%s" % (_dev_label(led["config"], me) if me else "尚未确定，请加 --device <别名>"))
     return 0
 
 
@@ -422,22 +516,52 @@ def cmd_scan(args):
     return 0
 
 
+def _default_project_id(name):
+    """An ID derived from the project name that the engine accepts (Phase A rules); "" when none fits."""
+    pid = re.sub(r"\.{2,}", ".", re.sub(r"[^A-Za-z0-9_.-]+", "-", str(name or ""))).strip("-. ")
+    try:
+        V.validate_project_id(pid)
+    except V.ValidationError:
+        return ""
+    return pid
+
+
+def _project_id_problem(pid):
+    """Why a new project ID cannot enter the ledger ("" when it can): the same rule publish/send/receive apply."""
+    try:
+        V.validate_project_id(pid)
+    except V.ValidationError as e:
+        return e.message
+    return ""
+
+
 def cmd_add(args):
     path, local = ctx()
     box = {}
 
     def fn(led):
         h = need_here(led, local)
-        pid = args.id or re.sub(r"[^A-Za-z0-9_.-]+", "-", args.name).strip("-")
+        pid = args.id or _default_project_id(args.name)
         if not pid:
             pid = L.new_id("p_")
+        problem = _project_id_problem(pid)
+        if problem:
+            # Fix G: refused at registration, not first at publish (Phase A projectId rule).
+            raise CliError("%s 请用 --id 指定合法的项目 ID（以字母或数字开头，例如 my-project）。" % problem, 1)
         if not re.match(r"^[A-Za-z0-9_.-]+$", pid):
             raise CliError("项目 id 只能含字母、数字、下划线、点和连字符：%s" % pid, 1)
         if any(p["id"] == pid for p in led["projects"]):
             raise CliError("已经有 id 为 %s 的项目。用 --id 指定另一个。" % pid, 1)
-        o = L.other(led["config"], h)["id"]
-        p = L.norm_project({"id": pid, "name": args.name, "device": h, "tool": args.tool or "claude",
-                            "paths": {h: os.path.abspath(args.path), o: ""}}, led["config"])
+        others = devices.list_other_devices(led["config"], h)
+        abs_path = os.path.abspath(args.path)
+        paths = {h: abs_path}
+        if len(others) == 1:
+            paths.setdefault(others[0]["id"], "")
+        proj_init = {"id": pid, "name": args.name, "device": h, "tool": args.tool or "claude", "paths": paths}
+        h_did = str(L.dev(led["config"], h).get("deviceId") or "").strip()
+        if h_did:
+            proj_init["pathsByDeviceId"] = {h_did: abs_path}
+        p = L.norm_project(proj_init, led["config"])
         L.touch(p, h)
         led["projects"].append(p)
         box["id"] = pid
@@ -496,16 +620,41 @@ def cmd_set(args):
         if args.path_here is not None or args.alt_path or args.path_other is not None:
             if not h:
                 raise CliError(NEED_DEVICE, 1)
-            o = L.other(led["config"], h)["id"]
+        if args.path_other is not None:
+            if args.for_device:
+                try:
+                    target_dev = devices.resolve_target_device(
+                        led["config"], h, to_query=args.for_device, require_paired_cloud=False
+                    )
+                except devices.AmbiguousDeviceError as e:
+                    raise CliError(_format_candidates_msg(str(e), e.candidates), 1)
+                except (LookupError, ValueError) as e:
+                    raise CliError(str(e), 1)
+                o = target_dev["id"]
+            else:
+                others = devices.list_other_devices(led["config"], h)
+                if len(others) == 0:
+                    raise CliError("台账里没有其他目标设备，请先使用 relay device --add <别名> 添加。", 1)
+                if len(others) > 1:
+                    cand_text = "、".join("%s（%s）" % (d.get("name") or d["id"], d["id"]) for d in others)
+                    raise CliError("台账中有多台其他设备（%s），请使用 --for-device <别名> 指定要设置路径的设备。" % cand_text, 1)
+                o = others[0]["id"]
         if args.path_here is not None:
-            p["paths"][h] = os.path.abspath(args.path_here) if args.path_here else ""
+            abs_here = os.path.abspath(args.path_here) if args.path_here else ""
+            p["paths"][h] = abs_here
+            h_did = str(L.dev(led["config"], h).get("deviceId") or "").strip()
+            if h_did and isinstance(p.get("pathsByDeviceId"), dict):
+                p["pathsByDeviceId"][h_did] = abs_here
             changed.append("本机路径")
         if args.path_other is not None:
             val, notice = fix_foreign_path(led["config"], o, args.path_other, "--path-other")
             if notice:
                 out(notice)
             p["paths"][o] = val
-            changed.append("另一台设备的路径")
+            o_did = str(L.dev(led["config"], o).get("deviceId") or "").strip()
+            if o_did and isinstance(p.get("pathsByDeviceId"), dict):
+                p["pathsByDeviceId"][o_did] = val
+            changed.append("另一台设备的路径" if len(devices.list_other_devices(led["config"], h)) <= 1 else ("设备 %s 的路径" % o))
         if args.alt_path:
             alt = p.setdefault("altPaths", {})
             lst = alt.setdefault(h, [])
@@ -515,12 +664,20 @@ def cmd_set(args):
                     lst.append(a)
             changed.append("其他启动目录")
         for attr, key, label in (("tool", "tool", "工具"), ("status", "status", "状态"),
-                                 ("transport", "transport", "传输方式"), ("worktree", "worktree", "工作树"),
-                                 ("device", "device", "所在设备")):
+                                 ("transport", "transport", "传输方式"), ("worktree", "worktree", "工作树")):
             v = getattr(args, attr)
             if v is not None:
                 p[key] = v
                 changed.append(label)
+        if args.device is not None:
+            try:
+                resolved_dev = devices.resolve_device_entry(led["config"], args.device)
+            except devices.AmbiguousDeviceError as e:
+                raise CliError(_format_candidates_msg(str(e), e.candidates), 1)
+            except LookupError as e:
+                raise CliError(str(e), 1)
+            p["device"] = resolved_dev["id"]
+            changed.append("所在设备")
         if not changed:
             raise CliError("没有要修改的内容。用 --path-here、--tool、--status 等选项指定。", 1)
         L.touch(p, h)
@@ -708,11 +865,33 @@ def cmd_handoff(args):
         if proj.get("handoff"):
             box["existing"] = True
             return
-        ho = plan.new_handoff(proj, l["config"], args.transport)
-        if args.to:
-            if args.to == ho.get("from"):
-                raise CliError("--to 不能是出发的设备自己（%s）。" % args.to, 1)
-            ho["to"] = args.to
+        target_id = None
+        if args.to is not None:
+            try:
+                target_dev = devices.resolve_target_device(
+                    l["config"], proj["device"], to_query=args.to, require_paired_cloud=False
+                )
+                target_id = target_dev["id"]
+            except devices.AmbiguousDeviceError as e:
+                raise CliError(_format_candidates_msg(str(e), e.candidates), 1)
+            except (LookupError, ValueError) as e:
+                raise CliError(str(e), 1)
+        else:
+            try:
+                target_dev = devices.resolve_target_device(
+                    l["config"], proj["device"], to_query=None, require_paired_cloud=False
+                )
+                target_id = target_dev["id"]
+            except devices.AmbiguousDeviceError as e:
+                raise CliError(_format_candidates_msg(str(e), e.candidates), 1)
+            except LookupError:
+                target_id = None
+        if "to_id" in inspect.signature(plan.new_handoff).parameters:
+            ho = plan.new_handoff(proj, l["config"], args.transport, to_id=target_id)
+        else:
+            ho = plan.new_handoff(proj, l["config"], args.transport)
+            if target_id:
+                ho["to"] = target_id
         proj["handoff"] = ho
         L.touch(proj, h)
 
@@ -896,41 +1075,263 @@ def cmd_conflict_add(args):
 
 # ---------------------------------------------------------------- devices, export/import
 
+def _fallback_list_devices(path, local):
+    led = L.load(path)
+    here_id = L.here(led, local) or ""
+    ident = L._load_identity()
+    dev_id = str(ident.get("deviceId") or "")
+    key_fp = str(ident.get("keyFingerprint") or "")
+    cloud_path = L.local_dir() / "cloud.json"
+    peers_map = {}
+    if cloud_path.exists():
+        try:
+            with open(str(cloud_path), "r", encoding="utf-8-sig") as fh:
+                raw_cl = json.load(fh)
+            if isinstance(raw_cl, dict):
+                peers_map = (devices.migrate_cloud_config(raw_cl).get("peers") or {})
+        except (OSError, ValueError, UnicodeDecodeError):
+            peers_map = {}
+    out_devices = []
+    seen_dids = set()
+    for d in led["config"]["devices"]:
+        if not isinstance(d, dict):
+            continue
+        d_id = str(d.get("id") or "")
+        d_did = str(d.get("deviceId") or "")
+        is_here = bool(here_id and d_id == here_id)
+        if is_here and not d_did and dev_id:
+            d_did = dev_id
+        peer = peers_map.get(d_did) if d_did else None
+        if peer is None and not is_here and not d_did:
+            for p in peers_map.values():
+                if isinstance(p, dict) and str(p.get("alias") or "") == d_id:
+                    peer = p
+                    break
+        if d_did:
+            seen_dids.add(d_did)
+        if is_here:
+            status, paired, caps, proto_ver, kfp, pfp, paired_at = (
+                "self", True, ["v2", "v3"], 3, key_fp, "", ""
+            )
+        elif isinstance(peer, dict):
+            status = str(peer.get("status") or ("paired" if peer.get("paired") else "discovered"))
+            paired = bool(peer.get("paired") and status == "paired")
+            caps = list(peer.get("capabilities") or ["v2"])
+            proto_ver = int(peer.get("protocolVersion") or 2)
+            kfp = str(peer.get("keyFingerprint") or "")
+            pfp = str(peer.get("pairFingerprint") or "")
+            paired_at = str(peer.get("pairedAt") or "")
+        else:
+            status, paired, caps, proto_ver, kfp, pfp, paired_at = (
+                "unpaired", False, [], 0, "", "", ""
+            )
+        out_devices.append({
+            "id": d_id,
+            "alias": d_id,
+            "name": str(d.get("name") or (peer.get("name") if isinstance(peer, dict) else "") or ""),
+            "os": str(d.get("os") or (peer.get("os") if isinstance(peer, dict) else "") or ""),
+            "host": str(d.get("host") or (peer.get("host") if isinstance(peer, dict) else "") or ""),
+            "deviceId": d_did or (str(peer.get("deviceId") or "") if isinstance(peer, dict) else ""),
+            "isHere": is_here,
+            "paired": paired,
+            "status": status,
+            "keyFingerprint": kfp,
+            "pairFingerprint": pfp,
+            "protocolVersion": proto_ver,
+            "capabilities": caps,
+            "pairedAt": paired_at,
+            "needsPairing": bool(d.get("needsPairing")),
+        })
+    for did, p in sorted(peers_map.items()):
+        if not isinstance(p, dict) or did in seen_dids:
+            continue
+        out_devices.append({
+            "id": str(p.get("alias") or ""),
+            "alias": str(p.get("alias") or ""),
+            "name": str(p.get("name") or ""),
+            "os": str(p.get("os") or ""),
+            "host": str(p.get("host") or ""),
+            "deviceId": did,
+            "isHere": False,
+            "paired": bool(p.get("paired") and p.get("status") == "paired"),
+            "status": str(p.get("status") or "discovered"),
+            "keyFingerprint": str(p.get("keyFingerprint") or ""),
+            "pairFingerprint": str(p.get("pairFingerprint") or ""),
+            "protocolVersion": int(p.get("protocolVersion") or 2),
+            "capabilities": list(p.get("capabilities") or ["v2"]),
+            "pairedAt": str(p.get("pairedAt") or ""),
+            "needsPairing": False,
+        })
+    return {
+        "here": here_id,
+        "deviceId": dev_id,
+        "keyFingerprint": key_fp,
+        "capabilities": ["v2", "v3"],
+        "devices": out_devices,
+    }
+
+
+def _rotation_guard(args):
+    """Phase D: refuse a key rotation that would strand in-flight handoffs, unless --force (consequences printed)."""
+    dx = _mod("diagnostics")
+    blockers = dx.rotation_blockers(L.local_dir())
+    if not blockers:
+        return
+    lines = []
+    for f in blockers:
+        lines.append("  - %s" % f["reason"])
+        lines.append("    处理命令：%s" % f["command"])
+    if not getattr(args, "force", False):
+        raise CliError("本机还有未完成的交接或恢复事务；现在换钥，这些交接包将无法被对方领取或验证：\n%s\n"
+                       "请先按上面的命令处理完再换钥。确需立即换钥请加 --force，之后在途交接需要用 "
+                       "relay send <项目> --to <设备> --reissue 重新签发（原交接包保持不变）。" % "\n".join(lines), 4)
+    warn("已按 --force 换钥。以下交接或事务会受影响：\n%s\n在途交接需要在对方重新确认本机新指纹后，用 "
+         "relay send <项目> --to <设备> --reissue 重新签发；原交接包保持不变。" % "\n".join(lines))
+
+
 def cmd_device(args):
+    if args.rotate_keys:
+        _rotation_guard(args)
     path, local = ctx()
-    modify = args.name is not None or args.os is not None or args.drop is not None
-    if modify:
+    if args.add is not None:
+        if args.which is not None:
+            raise CliError("--add 与 --which 不能同时使用。", 1)
+        try:
+            new_alias = devices.validate_alias(args.add)
+        except ValueError as e:
+            raise CliError(str(e), 1)
         box = {}
 
-        def fn(led):
-            which = args.which or L.here(led, local)
-            if not which:
-                raise CliError(NEED_DEVICE + "或者加 --which a|b。", 1)
-            d = L.dev(led["config"], which)
-            if d["id"] != which:
-                raise CliError("没有设备 %s。" % which, 1)
-            if args.name is not None:
-                d["name"] = args.name
+        def fn_add(led):
+            devs = led["config"]["devices"]
+            if any(str(d.get("id") or "").lower() == new_alias.lower() for d in devs):
+                raise CliError("设备别名「%s」已存在。" % new_alias, 1)
+            entry = {
+                "id": new_alias,
+                "name": args.name if args.name is not None else ("设备 %s" % new_alias),
+                "os": args.os or "linux",
+                "drop": "",
+                "host": "",
+                "deviceId": "",
+            }
             if args.os is not None:
-                d["os"] = args.os
-                d["osExplicit"] = True
+                entry["osExplicit"] = True
+            devs.append(entry)
             if args.drop is not None:
-                if which != L.here(led, local):
-                    val, notice = fix_foreign_path(led["config"], which, args.drop, "--drop")
+                if new_alias != L.here(led, local):
+                    val, notice = fix_foreign_path(led["config"], new_alias, args.drop, "--drop")
                     if notice:
                         out(notice)
-                    d["drop"] = val
+                    entry["drop"] = val
                 else:
-                    d["drop"] = args.drop
-            box["id"] = which
-        L.update(path, fn)
-        out("已更新设备 %s。" % box["id"])
+                    entry["drop"] = args.drop
+            box["id"] = new_alias
+
+        try:
+            L.update(path, fn_add)
+        except devices.DeviceConflictError as e:
+            raise CliError(str(e), 1)
+        if not args.json:
+            out("已添加设备 %s。" % box["id"])
+    else:
+        modify = args.name is not None or args.os is not None or args.drop is not None
+        if modify:
+            box = {}
+
+            def fn(led):
+                which = args.which or L.here(led, local)
+                if not which:
+                    raise CliError(NEED_DEVICE + "或者加 --which <别名>。", 1)
+                try:
+                    d = devices.resolve_device_entry(led["config"], which)
+                except devices.AmbiguousDeviceError as e:
+                    raise CliError(_format_candidates_msg(str(e), e.candidates), 1)
+                except LookupError:
+                    raise CliError("没有设备 %s。" % which, 1)
+                resolved_id = d["id"]
+                if args.name is not None:
+                    d["name"] = args.name
+                if args.os is not None:
+                    d["os"] = args.os
+                    d["osExplicit"] = True
+                if args.drop is not None:
+                    if resolved_id != L.here(led, local):
+                        val, notice = fix_foreign_path(led["config"], resolved_id, args.drop, "--drop")
+                        if notice:
+                            out(notice)
+                        d["drop"] = val
+                    else:
+                        d["drop"] = args.drop
+                box["id"] = resolved_id
+
+            try:
+                L.update(path, fn)
+            except devices.DeviceConflictError as e:
+                raise CliError(str(e), 1)
+            if not args.json:
+                out("已更新设备 %s。" % box["id"])
+
+    if args.rotate_keys:
+        crypto = _mod("crypto")
+        rotated = _call_engine(crypto.rotate_identity_keys, L.local_dir())
+        rot_did = str(rotated.get("deviceId") or "")
+        rot_fp = str(rotated.get("keyFingerprint") or "")
+        rot_at = str(rotated.get("rotatedAt") or "")
+        rot_alias_box = {"alias": str(rotated.get("alias") or "")}
+
+        def fn_sync_rot(led):
+            me = L.here(led, local)
+            target = None
+            for d in led["config"]["devices"]:
+                if me and d.get("id") == me:
+                    target = d
+                    break
+            if target is None and rot_did:
+                for d in led["config"]["devices"]:
+                    if d.get("deviceId") == rot_did:
+                        target = d
+                        break
+            if target is None and rot_alias_box["alias"]:
+                for d in led["config"]["devices"]:
+                    if d.get("id") == rot_alias_box["alias"]:
+                        target = d
+                        break
+            if target is not None:
+                target["deviceId"] = rot_did
+                target["keyFingerprint"] = rot_fp
+                if rot_at:
+                    target["rotatedAt"] = rot_at
+                rot_alias_box["alias"] = target["id"]
+
+        L.update(path, fn_sync_rot)
+        if rot_did and local.get("deviceId") != rot_did:
+            local["deviceId"] = rot_did
+            L.save_local(local)
+        if not args.json:
+            out("已轮换本机密钥（deviceId=%s，新公钥指纹=%s）。请在对端设备重新运行 relay pair --with %s --accept 核对新指纹。" % (
+                rot_did, rot_fp, rot_alias_box["alias"] or rot_did))
+
+    if args.json:
+        try:
+            eng = _mod("relay_engine")
+            res = _call_engine(eng.list_devices, ledger_path=path, local=local)
+        except Exception:
+            res = _fallback_list_devices(path, local)
+        out(json.dumps(res, ensure_ascii=False, indent=1))
+        return 0
+
     led = L.load(path)
     me = L.here(led, local)
     for d in led["config"]["devices"]:
-        out("%s  %s  系统 %s  中转目录 %s  主机名 %s%s" % (
+        extra = []
+        if d.get("deviceId"):
+            extra.append("ID:%s" % d["deviceId"])
+        if d.get("needsPairing"):
+            extra.append("待配对")
+        tail = ("  [" + ", ".join(extra) + "]") if extra else ""
+        out("%s  %s  系统 %s  中转目录 %s  主机名 %s%s%s" % (
             d["id"], d.get("name", ""), d.get("os", ""), d.get("drop") or "（未填）", d.get("host") or "（未填）",
-            "  <- 本机" if d["id"] == me else ""))
+            "  <- 本机" if d["id"] == me else "", tail))
     return 0
 
 
@@ -986,7 +1387,23 @@ def cmd_import(args):
     path, local = ctx()
     stat = {"add": 0, "upd": 0, "keep": 0}
 
+    def check_ids(led):
+        # Fix G: a backup must not bring in project IDs the engine refuses; IDs already in this
+        # ledger (registered by an older version) may come back unchanged.
+        existing = {cur.get("id") for cur in led["projects"]}
+        bad = []
+        for p in data["projects"]:
+            pid = p.get("id") if isinstance(p, dict) else None
+            if pid and pid not in existing:
+                problem = _project_id_problem(pid)
+                if problem:
+                    bad.append(problem)
+        if bad:
+            raise CliError("备份里有不符合项目 ID 规则的新项目，未导入任何内容：%s 请在备份文件中改成合法的 ID 后重试。"
+                           % " ".join(bad[:5]), 1)
+
     def fn(led):
+        check_ids(led)
         if args.replace:
             old_hosts = dict((d["id"], d.get("host") or "") for d in led["config"]["devices"])
             led["config"] = L.norm_config(data.get("config"))
@@ -1046,6 +1463,8 @@ class _FileStore(object):
 def _call_engine(fn, *a, **kw):
     try:
         return fn(*a, **kw)
+    except devices.AmbiguousDeviceError as e:
+        raise CliError(_format_candidates_msg(str(e), e.candidates), 1)
     except (CliError, LookupError, L.LedgerError, OSError):
         raise
     except Exception as e:
@@ -1054,6 +1473,12 @@ def _call_engine(fn, *a, **kw):
             msg = str(e)
             if hasattr(e, "gaps") and "缺口" not in msg:
                 msg = "检测到会话缺口：\n" + msg
+            if hasattr(e, "candidates") and e.candidates:
+                msg = _format_candidates_msg(msg, e.candidates)
+            if hasattr(e, "reasons") and e.reasons:
+                missing_reasons = [str(r) for r in e.reasons if str(r) not in msg]
+                if missing_reasons:
+                    msg = msg + "\n原因：" + "；".join(missing_reasons)
             raise CliError(msg, 1)
         raise
 
@@ -1080,6 +1505,34 @@ def cmd_cloud_remotes(args):
     return 0
 
 
+def _match_peer_list(peers, query):
+    q = str(query or "").strip()
+    ql = q.lower()
+    if not q:
+        return []
+    by_did = [p for p in peers if str(p.get("deviceId") or "") == q]
+    if by_did:
+        return by_did
+    by_al_exact = [p for p in peers if str(p.get("alias") or "") == q]
+    if by_al_exact:
+        return by_al_exact
+    by_al_ci = [p for p in peers if str(p.get("alias") or "").lower() == ql]
+    if by_al_ci:
+        return by_al_ci
+    return [p for p in peers if str(p.get("name") or "").strip().lower() == ql]
+
+
+def _peer_status_zh(peer):
+    st_val = str(peer.get("status") or "")
+    if peer.get("paired") and st_val == "paired":
+        return "已配对"
+    if st_val == "key_changed":
+        return "密钥已变更（需重新核对）"
+    if st_val == "conflict":
+        return "别名冲突（%s）" % (peer.get("conflict") or "alias_conflict")
+    return "待确认"
+
+
 def cmd_pair(args):
     path, local = ctx()
     eng = _mod("relay_engine")
@@ -1090,9 +1543,23 @@ def cmd_pair(args):
         and args.provider is None
         and args.rclone_config is None
         and not args.accept
+        and args.fingerprint is None
+        and args.alias is None
+        and not args.replace_device
     )
     if only_status:
         st = _call_engine(eng.cloud_status, ledger_path=path, local=local)
+        if args.with_device:
+            matches = _match_peer_list(st.get("peers") or [], args.with_device)
+            if not matches:
+                raise CliError("找不到远端设备「%s」。" % args.with_device, 1)
+            if len(matches) > 1:
+                raise CliError(_format_candidates_msg("「%s」匹配到多台远端设备。" % args.with_device, matches), 1)
+            sel = matches[0]
+            st = dict(st)
+            st["peer"] = sel
+            st["paired"] = bool(sel.get("paired") and sel.get("status") == "paired")
+            st["pairFingerprint"] = str(sel.get("pairFingerprint") or "")
     else:
         st = _call_engine(
             eng.pair_device,
@@ -1101,6 +1568,10 @@ def cmd_pair(args):
             provider_type=args.provider,
             rclone_config=args.rclone_config,
             accept=args.accept,
+            with_device=args.with_device,
+            fingerprint=args.fingerprint,
+            alias=args.alias,
+            replace_device=args.replace_device,
             ledger_path=path,
             local=local,
         )
@@ -1118,6 +1589,32 @@ def cmd_pair(args):
     out("本机设备：%s（%s）" % (st.get("alias") or "未指定", st.get("deviceId") or "尚未生成密钥"))
     if st.get("keyFingerprint"):
         out("本机公钥指纹：%s" % st["keyFingerprint"])
+    rot = st.get("keyRotationConfirmed")
+    if isinstance(rot, dict) and rot.get("deviceId"):
+        out("已确认设备 %s 的新公钥（%s，原公钥 %s 已记为历史密钥）。之后 relay sync 会为新公钥重新投递对方缺失的快照；"
+            "原投递、回执和加密包保持不变，旧密钥不再获得新的发送权限。" % (
+                rot["deviceId"], rot.get("keyFingerprint") or "", rot.get("previousKeyFingerprint") or ""))
+    peers = st.get("peers") or []
+    if len(peers) > 1 and not args.with_device:
+        out("远端设备列表（共 %d 台）：" % len(peers))
+        for p in peers:
+            out("  - %s（%s，系统 %s）  状态：%s  配对指纹：%s" % (
+                p.get("alias") or "-",
+                p.get("deviceId") or "-",
+                p.get("os") or "-",
+                _peer_status_zh(p),
+                p.get("pairFingerprint") or "-",
+            ))
+            if p.get("keyFingerprint"):
+                out("    公钥指纹：%s" % p["keyFingerprint"])
+            if p.get("error"):
+                out("    冲突说明：%s" % p["error"])
+        paired_cnt = sum(1 for p in peers if p.get("paired") and p.get("status") == "paired")
+        if paired_cnt:
+            out("配对状态：已有 %d 台设备完成配对；新增或密钥变更设备可运行 relay pair --with <别名或deviceId> --accept" % paired_cnt)
+        else:
+            out("配对状态：存在待确认设备，核对配对指纹后运行 relay pair --with <别名或deviceId> --accept")
+        return 0
     peer = st.get("peer")
     if isinstance(peer, dict):
         out("对端设备：%s（%s，系统 %s）" % (peer.get("alias") or "", peer.get("deviceId") or "", peer.get("os") or ""))
@@ -1129,6 +1626,9 @@ def cmd_pair(args):
         out("配对指纹：%s" % st["pairFingerprint"])
     if st.get("paired"):
         out("配对状态：已配对（双机公钥已锁定）")
+    elif isinstance(peer, dict) and peer.get("status") == "key_changed":
+        out("配对状态：对端密钥已变更（请重新核对指纹后运行 relay pair --with %s --accept）" % (
+            peer.get("deviceId") or peer.get("alias") or ""))
     elif st.get("pairFingerprint"):
         out("配对状态：待确认（请核对两台设备显示的配对指纹完全一致后，运行 relay pair --accept）")
     else:
@@ -1136,13 +1636,12 @@ def cmd_pair(args):
     return 0
 
 
-def cmd_send(args):
+def cmd_publish(args):
     path, local = ctx()
     eng = _mod("relay_engine")
     res = _call_engine(
-        eng.send_project,
+        eng.publish_project,
         project_key=args.project,
-        to_alias=args.to,
         cwd=os.getcwd(),
         ledger_path=path,
         local=local,
@@ -1150,6 +1649,318 @@ def cmd_send(args):
     if args.json:
         out(json.dumps(res, ensure_ascii=False, indent=1))
         return 0
+    out(res.get("message") or ("项目快照已发布：%s（版本 %s）" % (res.get("projectName", ""), res.get("snapshotId", ""))))
+    out("快照编号：%s    项目：%s（%s）" % (res.get("snapshotId", ""), res.get("projectName", ""), res.get("projectId", "")))
+    if res.get("parentVersionIds"):
+        out("父版本：%s" % ", ".join(res["parentVersionIds"]))
+    out("SHA-256：%s    大小：%s 字节    归档会话：%s 条" % (
+        res.get("contentSha256", ""), res.get("contentSize", 0), res.get("sessionCount", 0)))
+    if res.get("excludedFiles"):
+        out("已自动排除本地敏感文件：%s" % "、".join(res["excludedFiles"]))
+    delivered = res.get("deliveredTo") or []
+    failed = res.get("deliveryErrors") or []
+    if delivered:
+        out("已推送同步至：%s" % "、".join((d.get("alias") or d.get("deviceId") or "") for d in delivered))
+    elif not failed:
+        out("当前没有其他已配对的 v3 节点，快照已缓存至本机。")
+    for f in failed:
+        warn("  [推送失败] %s（%s）：%s" % (f.get("alias") or f.get("peerDeviceId", ""), f.get("errorClass", ""),
+                                       f.get("error", "")))
+    if failed:
+        warn("快照已发布到本机缓存和云端索引；运行 relay sync 会继续向失败的设备投递。")
+    return 0
+
+
+_SYNC_TEXT_EVENTS = ("snapshot_cached", "snapshot_forwarded", "receipt_synced", "fork_detected", "problem",
+                     "resolved", "peer_state", "trust_changed", "round_skipped", "backoff", "run_started",
+                     "peer_verified", "delivery_obsolete", "lineage_unproven", "lineage_resolved")
+_OBSOLETE_REASON = {"sender_key_retired": "发送方换钥前的旧密钥签名", "recipient_key_retired": "发给本机换钥前的公钥"}
+_PEER_STATE_LABEL = {"healthy": "正常", "backoff": "重试中", "parked": "需要处理"}
+
+
+def _lineage_unproven_text(ev):
+    return ("证据不足（项目 %s）：无法证明本地 %s 与远端 %s 的先后关系，缺少可验证的父版本 %s；"
+            "这不是版本分叉，补齐签名记录后会自动复核（relay doctor 可查看）" % (
+                ev.get("projectId", ""), ev.get("localVersion", ""), ev.get("incomingVersion", ""),
+                "、".join(ev.get("missingVersions") or []) or "（未知）"))
+
+
+def _lineage_resolved_text(ev):
+    return "已补齐父版本证据（项目 %s）：%s 与 %s %s" % (
+        ev.get("projectId", ""), ev.get("localVersion", ""), ev.get("incomingVersion", ""),
+        "确认是版本分叉（已记入台账）" if ev.get("relation") == "fork" else "在同一条版本链上，不是分叉")
+
+
+def _short_time(iso):
+    text = str(iso or "")
+    return text[11:19] if len(text) >= 19 else text
+
+
+class _SyncOutput(object):
+    """Printers for `relay sync`: legacy text, streamed watch text, --json summary, --jsonl events."""
+
+    def __init__(self, args, sr):
+        self.args = args
+        self.sr = sr
+        self.jsonl = bool(getattr(args, "jsonl", False))
+        self.json = bool(getattr(args, "json", False))
+        self.watch_text = bool(args.watch) and not self.jsonl and not self.json
+        self.closed = False
+
+    def on_event(self, ev):
+        if self.closed:
+            return
+        if self.jsonl:
+            self._write_line(json.dumps(ev, ensure_ascii=False, separators=(",", ":")))
+        elif self.watch_text:
+            self._text_event(ev)
+
+    def _write_line(self, line, stream=None):
+        stream = stream or sys.stdout
+        try:
+            stream.write(line + "\n")
+            stream.flush()
+        except BrokenPipeError:
+            # The reader went away (e.g. `relay sync --jsonl | head`): silence stdout and let the
+            # engine treat this as cancellation; nothing more is printed.
+            self.closed = True
+            try:
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, stream.fileno())
+            except (OSError, ValueError, AttributeError):
+                pass
+            raise
+
+    def _text_event(self, ev):
+        kind = ev.get("kind")
+        if kind not in _SYNC_TEXT_EVENTS:
+            return
+        t = _short_time(ev.get("at"))
+        if kind == "run_started":
+            out("持续同步已启动：每 %s 秒一轮，暂时失败时最长退避 %s 秒（Ctrl+C 停止）。" % (
+                _fmt_num(ev.get("interval")), _fmt_num(ev.get("maxBackoff"))))
+        elif kind == "snapshot_cached":
+            out("[%s] + 快照 %s（项目 %s，作者 %s%s%s）" % (t, ev.get("snapshotId", ""), ev.get("projectId", ""),
+                                                   ev.get("authorDeviceId", ""), "，经转发" if ev.get("isForwarded") else "",
+                                                   "，修复本机缓存" if ev.get("repaired") else ""))
+        elif kind == "peer_verified":
+            out("[%s] = 对端 %s 已确认缓存快照 %s" % (t, ev.get("peerDeviceId", ""), ev.get("snapshotId", "")))
+        elif kind == "delivery_obsolete":
+            out("[%s] ~ 旧投递 %s 已过期（%s）%s" % (
+                t, ev.get("deliveryId", ""), _OBSOLETE_REASON.get(ev.get("reason"), ev.get("reason", "")),
+                "，已请求重新投递" if ev.get("needed") else ""))
+        elif kind == "snapshot_forwarded":
+            out("[%s] > 转发 %s → %s（%s）" % (t, ev.get("snapshotId", ""), ev.get("toAlias") or ev.get("toDeviceId", ""),
+                                          ev.get("projectId", "")))
+        elif kind == "receipt_synced":
+            out("[%s] 签收回执 %s（项目 %s，接收设备 %s%s）" % (t, ev.get("relayId", ""), ev.get("projectId", ""),
+                                                  ev.get("toDeviceId", ""), "，迟到" if ev.get("late") else ""))
+        elif kind == "fork_detected":
+            out("[%s] ! 检测到版本分叉（项目 %s）：本地 %s vs 远端 %s" % (
+                t, ev.get("projectId", ""), ev.get("localVersion", ""), ev.get("incomingVersion", "")))
+        elif kind == "lineage_unproven":
+            out("[%s] ? %s" % (t, _lineage_unproven_text(ev)))
+        elif kind == "lineage_resolved":
+            out("[%s] = %s" % (t, _lineage_resolved_text(ev)))
+        elif kind == "problem":
+            action = ("（处理：%s）" % ev["action"]) if ev.get("action") else ""
+            warn("[%s] [%s] %s%s" % (t, self.sr.class_label(ev.get("errorClass", "")), ev.get("message", ""), action))
+        elif kind == "resolved":
+            out("[%s] 已恢复：%s" % (t, ev.get("key", "")))
+        elif kind == "peer_state":
+            label_to = _PEER_STATE_LABEL.get(ev.get("to"), ev.get("to"))
+            extra = ("（%s 秒后重试）" % _fmt_num(ev.get("retryInSec"))) if ev.get("to") == "backoff" else ""
+            out("[%s] 对端 %s：%s → %s%s" % (t, ev.get("peerDeviceId", ""), _PEER_STATE_LABEL.get(ev.get("from"), ev.get("from")),
+                                        label_to, extra))
+        elif kind == "trust_changed":
+            what = {"identity": "本机密钥", "connection": "云存储连接", "peer": "对端设备 %s" % ev.get("peerDeviceId", "")}
+            out("[%s] 信任配置已变化：%s" % (t, what.get(ev.get("what"), ev.get("what"))))
+        elif kind == "round_skipped" and int(ev.get("streak") or 1) == 1:
+            out("[%s] 本机有其他交棒、同步或接棒操作正在进行，跳过本轮（持续忙时不再重复提示）。" % t)
+        elif kind == "backoff" and int(ev.get("attempt") or 1) == 1:
+            out("[%s] 云端暂时不可用，%s 秒后重试（之后逐步延长，最长 %s 秒）。" % (
+                t, _fmt_num(ev.get("retryInSec")), _fmt_num(self.args.max_backoff)))
+
+    def summary(self, res):
+        if self.closed:
+            return
+        if self.jsonl:
+            return  # the engine already streamed the final {"kind":"summary"} event
+        if self.json:
+            out(json.dumps(res, ensure_ascii=False, indent=1))
+            return
+        c = res.get("counters") or {}
+        status = res.get("status", "")
+        if self.watch_text:
+            fo = c.get("failedOperations") or {}
+            unresolved = res.get("unresolved") or []
+            worst = self.sr.status_label(status)
+            out("持续同步已停止（%s）：共 %d 轮，缓存 %d、转发 %d、回执 %d；重试 %d 次；未解决 %d 项%s" % (
+                worst, res.get("cycles", 0), c.get("snapshotsCached", 0), c.get("forwarded", 0),
+                c.get("receiptsSynced", 0), c.get("retriesScheduled", 0), len(unresolved),
+                ("（%s）" % self.sr.class_label(unresolved[0].get("errorClass", ""))) if unresolved else ""))
+            if sum(int(v or 0) for v in fo.values()):
+                out("  失败操作：%s" % "，".join("%s %d" % (self.sr.class_label(k), v) for k, v in sorted(fo.items()) if v))
+        else:
+            out("网络同步完成（共 %d 轮）：" % res.get("cycles", 1))
+            out("  签收回执：%d 条    同步快照：%d 个    转发快照：%d 个    版本分叉：%d 个" % (
+                c.get("receiptsSynced", len(res.get("syncedReceipts") or [])),
+                c.get("snapshotsCached", len(res.get("syncedSnapshots") or [])),
+                c.get("forwarded", len(res.get("forwarded") or [])),
+                c.get("forksDetected", len(res.get("conflictsDetected") or [])),
+            ))
+            for sn in res.get("syncedSnapshots") or []:
+                out("  + 快照 %s（项目 %s，作者 %s%s）" % (
+                    sn.get("snapshotId", ""), sn.get("projectId", ""), sn.get("authorDeviceId", ""),
+                    "，经转发" if sn.get("isForwarded") else ""))
+            for f in res.get("forwarded") or []:
+                out("  > 转发 %s → %s（%s）" % (
+                    f.get("snapshotId", ""), f.get("toAlias") or f.get("toDeviceId", ""), f.get("projectId", "")))
+            for cf in res.get("conflictsDetected") or []:
+                out("  ! 检测到版本分叉（项目 %s）：本地 %s vs 远端 %s" % (
+                    cf.get("projectId", ""), cf.get("localVersion", ""), cf.get("incomingVersion", "")))
+            for lu in res.get("lineageUnproven") or []:
+                out("  ? %s" % _lineage_unproven_text(lu))
+            for ev in res.get("recentEvents") or []:
+                if ev.get("kind") == "lineage_resolved":
+                    out("  = %s" % _lineage_resolved_text(ev))
+            for e in res.get("errors") or []:
+                warn("  [同步警告] %s" % (e.get("error") or str(e)))
+            if any((res.get("legacyListsTruncated") or {}).values()):
+                out("  （明细仅列出最近 200 条，数量以上方计数为准）")
+        out("同步状态：%s" % self.sr.status_label(status))
+        for p in res.get("unresolved") or []:
+            warn("  未解决 [%s] %s%s" % (self.sr.class_label(p.get("errorClass", "")), p.get("message", ""),
+                                     ("\n    处理：%s" % p["action"]) if p.get("action") else ""))
+
+    def preloop_error(self, e):
+        """Map an error raised before the first round to (exit code, printed message)."""
+        sr = self.sr
+        if isinstance(e, devices.AmbiguousDeviceError):
+            msg, code = _format_candidates_msg(str(e), e.candidates), 1
+            classified = sr.ClassifiedError(sr.NEEDS_ACTION, "ambiguous_device", msg)
+        else:
+            classified = sr.classify_error(e, "trust_check")
+            msg = str(e) or classified.message
+            mod_name = getattr(e.__class__, "__module__", "") or ""
+            if hasattr(e, "candidates") and getattr(e, "candidates", None):
+                msg = _format_candidates_msg(msg, e.candidates)
+            if classified.error_class == sr.NEEDS_ACTION and (mod_name.startswith("relaydesk.") or isinstance(e, OSError)):
+                code = 4
+            elif isinstance(e, (L.LedgerError, OSError)):
+                code = 2
+                if isinstance(e, OSError):
+                    msg = "文件读写出错：%s" % e
+            elif isinstance(e, LookupError) or mod_name.startswith("relaydesk."):
+                code = 1
+            else:
+                raise e
+        if self.json or self.jsonl:
+            body = {"ok": False, "status": sr.NEEDS_ACTION_STATUS if code == 4 else "error", "error": msg,
+                    "code": classified.code, "errorClass": classified.error_class}
+            if classified.action:
+                body["action"] = classified.action
+            if self.jsonl:
+                body = dict({"schema": sr.EVENT_SCHEMA, "kind": "error"}, **body)
+                self._write_line(json.dumps(body, ensure_ascii=False, separators=(",", ":")))
+            else:
+                out(json.dumps(body, ensure_ascii=False, indent=1))
+        warn(msg)
+        if classified.action and code == 4:
+            warn("处理：%s" % classified.action)
+        return code
+
+
+def _fmt_num(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return ("%d" % f) if f == int(f) else ("%.1f" % f)
+
+
+def _install_sigterm(cancel):
+    """POSIX: SIGTERM requests cancellation (final summary, locks released). Returns a restore callable."""
+    if os.name == "nt":
+        return lambda: None
+    try:
+        import signal
+        import threading
+
+        if threading.current_thread() is not threading.main_thread():
+            return lambda: None
+        previous = signal.signal(signal.SIGTERM, lambda signum, frame: cancel.set())
+    except (ImportError, ValueError, OSError):
+        return lambda: None
+
+    def restore():
+        try:
+            signal.signal(signal.SIGTERM, previous)
+        except (ValueError, OSError):
+            pass
+
+    return restore
+
+
+def cmd_sync(args):
+    """`relay sync`: exit 0 success, 3 partial (retryable problems left), 4 needs action, 130 cancelled."""
+    import threading
+
+    sr = _mod("sync_runtime")
+    if args.max_backoff is not None and args.max_backoff < args.interval:
+        raise CliError("用法错误：--max-backoff 不能小于 --interval。", 1)
+    printer = _SyncOutput(args, sr)
+    cancel = threading.Event()
+    restore = _install_sigterm(cancel)
+    try:
+        try:
+            path, local = ctx()
+            eng = _mod("relay_engine")
+            res = eng.sync_network(
+                project_key=args.project,
+                watch=args.watch,
+                interval=args.interval,
+                max_cycles=args.max_cycles,
+                cwd=os.getcwd(),
+                ledger_path=path,
+                local=local,
+                max_backoff=args.max_backoff if args.max_backoff is not None else max(300.0, args.interval),
+                on_event=printer.on_event,
+                cancel=cancel,
+                mode="watch" if args.watch else "once",
+            )
+        except KeyboardInterrupt:
+            warn("已取消。")
+            return 130
+        except CliError:
+            raise
+        except Exception as e:
+            return printer.preloop_error(e)
+    finally:
+        restore()
+    printer.summary(res)
+    return sr.exit_code_for(res.get("status", ""))
+
+
+def cmd_send(args):
+    path, local = ctx()
+    eng = _mod("relay_engine")
+    kw = {"reissue": True} if getattr(args, "reissue", False) else {}
+    res = _call_engine(
+        eng.send_project,
+        project_key=args.project,
+        to_alias=args.to,
+        cwd=os.getcwd(),
+        ledger_path=path,
+        local=local,
+        **kw
+    )
+    if args.json:
+        out(json.dumps(res, ensure_ascii=False, indent=1))
+        return 0
+    if res.get("reissued"):
+        out("已重新签发交接：新交接 %s 取代 %s（原交接包和回执保持不变，对方只能领取新交接）。" % (
+            res["relayId"], res.get("supersedesRelayId", "")))
     out("交接包已上传并校验通过：%s（%s）" % (res["projectName"], res["projectId"]))
     out("交接编号：%s%s" % (res["relayId"], ("（父交接：%s）" % res["parentRelayId"]) if res.get("parentRelayId") else ""))
     out("流向：%s → %s    大小：%s 字节    归档会话：%s 条" % (
@@ -1226,6 +2037,194 @@ def cmd_receive(args):
         conv.get("total", 0), conv.get("added", 0), conv.get("updated", 0), res.get("projectId", "")))
     out("说明：原设备的本地原生 Session 仍留在原设备上；本机可读取 HANDOFF.md、台账与归档对话开启新会话继续工作。")
     return 0
+
+
+def cmd_recover(args):
+    path, local = ctx()
+    eng = _mod("relay_engine")
+    action = "rollback" if args.rollback else "status"
+    res = _call_engine(
+        eng.recover_relay,
+        args.relay_id,
+        action=action,
+        ledger_path=path,
+        local=local,
+    )
+    if args.json:
+        out(json.dumps(res, ensure_ascii=False, indent=1))
+        return 0
+    if action == "rollback":
+        out("已回滚事务：%s（阶段：%s）" % (res.get("relayId", args.relay_id), res.get("phase", "")))
+        if res.get("targetPath"):
+            out("目标目录：%s" % res["targetPath"])
+        if res.get("alreadyRolledBack"):
+            out("说明：该事务此前已回滚，未重复修改。")
+        return 0
+    if not res.get("exists"):
+        out("没有找到与 %s 相关的恢复事务记录。" % res.get("relayId", args.relay_id))
+        return 0
+    out("恢复事务：%s    状态：%s（阶段：%s）" % (
+        res.get("relayId", args.relay_id), res.get("state", ""), res.get("phase", "")))
+    if res.get("projectId"):
+        out("项目：%s" % res["projectId"])
+    if res.get("targetPath"):
+        out("目标目录：%s" % res["targetPath"])
+    out("可继续恢复：%s    可回滚：%s" % (
+        "是" if res.get("canResume") else "否",
+        "是" if res.get("canRollback") else "否",
+    ))
+    if res.get("pendingReceiptUpload"):
+        out("提示：本地工作区已就绪，待补传云端签收回执（可运行 relay receive %s）。" % res.get("relayId", args.relay_id))
+    for r in res.get("reasons") or []:
+        out("  原因：%s" % r)
+    return 0
+
+
+_SEVERITY_LABEL = {"error": "需要处理", "warning": "警告", "info": "提示"}
+_DOCTOR_STATUS = {"ok": "正常", "warning": "有警告", "needs_action": "需要处理"}
+
+
+def _fmt_bytes(n):
+    n = int(n or 0)
+    for unit, size in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= size:
+            return "%.1f %s" % (n / float(size), unit)
+    return "%d 字节" % n
+
+
+def _json_error(args, code, message, rc, **extra):
+    if getattr(args, "json", False):
+        body = {"ok": False, "code": code, "error": message}
+        body.update(extra)
+        out(json.dumps(body, ensure_ascii=False, indent=1))
+    warn(message)
+    return rc
+
+
+def cmd_doctor(args):
+    """`relay doctor [PROJECT]`: strictly read-only; exit 0 healthy, 3 warnings only, 4 something needs the user."""
+    dx = _mod("diagnostics")
+    try:
+        rep = dx.run_doctor(project_key=args.project, cwd=os.getcwd())
+    except LookupError as e:
+        return _json_error(args, "project_not_found", e.args[0] if e.args else str(e), 1)
+    if args.json:
+        out(json.dumps(rep, ensure_ascii=False, indent=1))
+        return dx.exit_code_for(rep["findings"])
+    dev = rep.get("device") or {}
+    c = rep.get("counts") or {}
+    out("relay doctor：本机 %s（%s）  状态：%s（需要处理 %d，警告 %d，提示 %d）" % (
+        dev.get("alias") or "未识别", dev.get("deviceId") or "无设备身份", _DOCTOR_STATUS.get(rep["status"], rep["status"]),
+        c.get("error", 0), c.get("warning", 0), c.get("info", 0)))
+    for pv in rep.get("projects") or []:
+        ed = pv.get("editor") or {}
+        line = "项目 %s「%s」：当前编辑设备 %s%s" % (pv["projectId"], pv["projectName"], ed.get("name") or ed.get("alias")
+                                                or "未知", "（本机）" if ed.get("isHere") else "")
+        ho = pv.get("handoff")
+        if ho:
+            line += "；在途交接 %s：%s → %s" % (ho.get("relayId", ""), ho.get("from", ""), ho.get("to", ""))
+        out(line)
+        out("  已确认缓存：%s；等待确认：%s；待补发：%s；未知：%s" % tuple(
+            "、".join(pv.get(k) or []) or "—" for k in ("confirmedCache", "awaiting", "pendingResend", "unknown")))
+    for f in rep.get("findings") or []:
+        where = "  ".join(x for x in (
+            ("项目 %s" % f["projectId"]) if f.get("projectId") else "",
+            ("交接 %s" % f["relayId"]) if f.get("relayId") else "") if x)
+        out("[%s] %s%s" % (_SEVERITY_LABEL.get(f["severity"], f["severity"]), f["code"], ("  " + where) if where else ""))
+        out("  原因：%s" % f["reason"])
+        out("  处理命令：%s" % f["command"])
+    if not rep.get("findings"):
+        out("未发现需要处理的问题。")
+    return dx.exit_code_for(rep["findings"])
+
+
+def cmd_cache_status(args):
+    cp = _mod("cache_prune")
+    try:
+        res = cp.cache_status(project_key=args.project, cwd=os.getcwd())
+    except LookupError as e:
+        return _json_error(args, "project_not_found", e.args[0] if e.args else str(e), 1)
+    blocked_rc = 4 if any(b.get("severity") == "error" for b in res.get("blocked") or []) else 0
+    if args.json:
+        out(json.dumps(res, ensure_ascii=False, indent=1))
+        return blocked_rc
+    pl, sm, ck, rc, lo, pr = (res[k] for k in ("payloads", "signedMetadata", "checkpoints", "recovery", "leftovers",
+                                               "prunable"))
+    states = pl.get("states") or {}
+    out("本机缓存（%s）%s：" % (res["home"], ("，项目 %s" % res["project"]) if res.get("project") else ""))
+    out("  快照载荷：%d 个，%s（已验证 %d，损坏或状态不明 %d）；保留 %d，可清理 %d" % (
+        pl["count"], _fmt_bytes(pl["bytes"]), states.get("verified", 0),
+        sum(v for k, v in states.items() if k != "verified"), pl["retained"], pl["deletable"]))
+    out("  签名元数据：%d 个，%s（其中谱系文件 %d 个，始终保留）" % (sm["count"], _fmt_bytes(sm["bytes"]), sm["lineageFiles"]))
+    out("  密文检查点：%d 个，%s；保留 %d，可清理 %d" % (ck["count"], _fmt_bytes(ck["bytes"]), ck["kept"], ck["deletable"]))
+    out("  恢复数据：%d 个事务，%s（未完成 %d，无法读取 %d；从不清理）" % (
+        rc["count"], _fmt_bytes(rc["bytes"]), rc["incomplete"], rc["unreadable"]))
+    if lo["count"]:
+        out("  上次清理中断留下的目录：%d 个，%s" % (lo["count"], _fmt_bytes(lo["bytes"])))
+    for b in res.get("blocked") or []:
+        warn("[%s] %s\n  处理命令：%s" % (_SEVERITY_LABEL.get(b["severity"], ""), b["reason"], b["command"]))
+    out("预计可释放：%s（运行 relay cache prune --dry-run 查看明细）" % _fmt_bytes(pr["bytes"]))
+    return blocked_rc
+
+
+def _print_prune_items(res):
+    for x in res["deletable"]["payloads"]:
+        out("  [删除] 快照 %s（项目 %s，%s）：%s" % (x["snapshotId"], x.get("projectId") or "?", _fmt_bytes(x["bytes"]),
+                                              x["reasonText"]))
+    for x in res["deletable"]["checkpoints"]:
+        out("  [删除] 检查点 %s（投递 %s → %s，%s）：%s" % (x["name"][:12], x.get("deliveryId", ""),
+                                                   x.get("toDeviceId", ""), _fmt_bytes(x["bytes"]), x["reasonText"]))
+    for x in res["deletable"]["leftovers"]:
+        out("  [删除] %s（%s）：%s" % (x["name"], _fmt_bytes(x["bytes"]), x["reasonText"]))
+    for x in res["kept"]["payloads"]:
+        texts = x.get("reasonTexts") or [x["reasonText"]]
+        tag = "保留并报告" if x["reason"] in ("corrupt", "unexpected_files", "foreign", "lineageConflict") else "保留"
+        out("  [%s] 快照 %s：%s%s" % (tag, x["snapshotId"], "、".join(texts),
+                                    ("（%s）" % x["problem"]) if x.get("problem") else ""))
+    for x in res["kept"]["checkpoints"]:
+        out("  [保留] 检查点 %s（投递 %s）：%s%s" % (x["name"][:12], x.get("deliveryId", "") or "?", x["reasonText"],
+                                             ("（%s）" % x["problem"]) if x.get("problem") else ""))
+
+
+def cmd_cache_prune(args):
+    cp = _mod("cache_prune")
+    eng = _mod("relay_engine")
+    try:
+        res = cp.prune(project_key=args.project, cwd=os.getcwd(), apply=bool(args.apply),
+                       expect_plan=args.expect_plan or None)
+    except LookupError as e:
+        return _json_error(args, "project_not_found", e.args[0] if e.args else str(e), 1)
+    except cp.PrunePlanChangedError as e:
+        return _json_error(args, e.code, e.message, 3, planDigest=e.plan.get("planDigest"), plan=e.plan)
+    except eng.RelayError as e:
+        return _json_error(args, e.code, e.message, 3 if e.code == "busy" else 1)
+    if args.json:
+        out(json.dumps(res, ensure_ascii=False, indent=1))
+    else:
+        c = res["counts"]
+        if res["status"] == "blocked":
+            warn("本机状态无法读取，已停止清理，没有删除任何内容：")
+            for b in res.get("blocked") or []:
+                warn("  原因：%s\n  处理命令：%s" % (b["reason"], b["command"]))
+        elif res["mode"] == "dry-run":
+            out("清理预览（不会删除任何内容）：可删除快照载荷 %d 个、检查点 %d 个、残留目录 %d 个，预计释放 %s。" % (
+                c["deletablePayloads"], c["deletableCheckpoints"], c["leftovers"], _fmt_bytes(res["estimatedBytesFreed"])))
+            _print_prune_items(res)
+            out("计划摘要：%s（确认后运行 relay cache prune --apply --expect-plan %s；计划变化时不会删除）" % (
+                res["planDigest"], res["planDigest"]))
+        else:
+            d = res.get("deleted") or {}
+            out("已清理：删除快照载荷 %d 个、检查点 %d 个、残留目录 %d 个，释放 %s。保留 %d 个快照载荷、%d 个检查点。" % (
+                len(d.get("payloads") or []), len(d.get("checkpoints") or []), len(d.get("leftovers") or []),
+                _fmt_bytes(res.get("bytesFreed")), c["keptPayloads"], c["keptCheckpoints"]))
+            for x in res.get("failed") or []:
+                warn("  [未删除] %s：%s" % (x.get("snapshotId") or x.get("name"), x.get("error", "")))
+            out("签名元数据已保存到 cache/lineage；缓存清单会在下次 relay sync 时重新发布。")
+        if c["unclear"]:
+            warn("有 %d 个条目损坏或状态不明，已保留，详见 --json 中的 unclear。" % c["unclear"])
+    if res["status"] == "blocked":
+        return 4 if any(b.get("severity") == "error" for b in res.get("blocked") or []) else 3
+    return {"success": 0, "partial": 3}.get(res["status"], 1)
 
 
 def cmd_transcripts(args):
@@ -1396,7 +2395,8 @@ def build_parser():
         return sp
 
     sp = P("init", "写本机配置", cmd_init)
-    sp.add_argument("--device", choices=["a", "b"])
+    sp.add_argument("--device")
+    sp.add_argument("--name")
     sp.add_argument("--ledger")
     sp.add_argument("--host", action="store_true", help="把本机主机名记到该设备的 host")
 
@@ -1418,12 +2418,13 @@ def build_parser():
     sp.add_argument("project")
     sp.add_argument("--path-here")
     sp.add_argument("--path-other")
+    sp.add_argument("--for-device", dest="for_device")
     sp.add_argument("--alt-path", action="append")
     sp.add_argument("--tool", choices=PROJECT_TOOLS)
     sp.add_argument("--status", choices=["active", "paused", "blocked", "done"])
     sp.add_argument("--transport", choices=["", "remote", "bundle", "patch", "folder"])
     sp.add_argument("--worktree")
-    sp.add_argument("--device", choices=["a", "b"])
+    sp.add_argument("--device")
 
     sp = P("note", "记最近任务、下一步、验证", cmd_note)
     sp.add_argument("project")
@@ -1459,7 +2460,7 @@ def build_parser():
     sp = P("handoff", "建立接力", cmd_handoff)
     sp.add_argument("project")
     sp.add_argument("--transport", choices=["remote", "bundle", "patch", "folder"])
-    sp.add_argument("--to", choices=["a", "b"])
+    sp.add_argument("--to")
 
     sp = P("plan", "重新打印清单与命令", cmd_plan)
     sp.add_argument("project")
@@ -1489,10 +2490,15 @@ def build_parser():
     c.add_argument("--kept")
 
     sp = P("device", "查看或修改设备设置", cmd_device)
-    sp.add_argument("--which", choices=["a", "b"])
+    sp.add_argument("--which")
+    sp.add_argument("--add", metavar="ALIAS")
     sp.add_argument("--name")
     sp.add_argument("--os", choices=["windows", "mac", "linux"])
     sp.add_argument("--drop")
+    sp.add_argument("--rotate-keys", action="store_true")
+    sp.add_argument("--force", action="store_true",
+                    help="与 --rotate-keys 同用：即使有在途交接或未完成的恢复事务也换钥（会列出受影响的交接）")
+    sp.add_argument("--json", action="store_true")
 
     sp = P("export", "导出备份", cmd_export)
     sp.add_argument("file", nargs="?")
@@ -1520,18 +2526,41 @@ def build_parser():
     rm.add_argument("--rclone-config")
     rm.add_argument("--json", action="store_true")
 
-    sp = P("pair", "配置云存储并配对双机公钥", cmd_pair)
+    sp = P("pair", "配置云存储并配对多机公钥", cmd_pair)
     sp.add_argument("--remote")
     sp.add_argument("--root")
     sp.add_argument("--provider", choices=["rclone", "local"], default=None)
     sp.add_argument("--rclone-config")
     sp.add_argument("--accept", action="store_true")
     sp.add_argument("--status", action="store_true")
+    sp.add_argument("--with", dest="with_device")
+    sp.add_argument("--fingerprint")
+    sp.add_argument("--alias")
+    sp.add_argument("--replace-device", action="store_true")
     sp.add_argument("--json", action="store_true")
+
+    sp = P("publish", "打包并发布项目快照到同步网络", cmd_publish)
+    sp.add_argument("project", nargs="?")
+    sp.add_argument("--json", action="store_true")
+
+    sp = P("sync", "同步云端回执、快照缓存与版本谱系（退出码：0 成功，3 部分失败，4 需要处理，130 已取消）", cmd_sync)
+    sp.add_argument("project", nargs="?")
+    sp.add_argument("--watch", action="store_true", help="持续同步；暂时性失败按上限退避重试，成功后恢复正常间隔")
+    sp.add_argument("--interval", type=float, default=5.0, help="两轮之间的秒数（默认 5）")
+    sp.add_argument("--max-cycles", type=int, default=None)
+    sp.add_argument("--max-backoff", type=float, default=None,
+                    help="暂时性失败时的最长重试间隔秒数（默认 300，不得小于 --interval）")
+    so = sp.add_mutually_exclusive_group()
+    so.add_argument("--json", action="store_true",
+                    help="结束（或中断）时输出一个汇总 JSON 对象；持续同步时也不会逐轮输出")
+    so.add_argument("--jsonl", action="store_true",
+                    help="逐条输出 JSON Lines 事件，最后一行 kind=summary；可与 --watch 一起使用，不能与 --json 同用")
 
     sp = P("send", "加密打包并自动上传交棒", cmd_send)
     sp.add_argument("project", nargs="?")
-    sp.add_argument("--to", choices=["a", "b"])
+    sp.add_argument("--to")
+    sp.add_argument("--reissue", action="store_true",
+                    help="目标设备换钥并重新确认后（或本机换钥后），为在途交接的同一快照重新签发：新交接编号、新密文，原交接包保持不变")
     sp.add_argument("--json", action="store_true")
 
     sp = P("inbox", "查看云端待接棒交接包并同步回执", cmd_inbox)
@@ -1542,6 +2571,33 @@ def build_parser():
     sp.add_argument("--path")
     sp.add_argument("--into")
     sp.add_argument("--json", action="store_true")
+
+    sp = P("recover", "查看或回滚中断的接力事务", cmd_recover)
+    sp.add_argument("relay_id")
+    rg = sp.add_mutually_exclusive_group()
+    rg.add_argument("--status", action="store_true")
+    rg.add_argument("--rollback", action="store_true")
+    sp.add_argument("--json", action="store_true")
+
+    sp = P("doctor", "只读诊断：身份、配对、当前编辑位置、未完成交接、恢复事务和最近同步结果（退出码 0/3/4）", cmd_doctor)
+    sp.add_argument("project", nargs="?")
+    sp.add_argument("--json", action="store_true")
+
+    cp = sub.add_parser("cache", help="本机缓存统计与安全清理")
+    css = cp.add_subparsers(dest="cache_cmd", metavar="{status,prune}", parser_class=_Parser)
+    css.required = True
+    a = css.add_parser("status", help="只读：快照载荷、签名元数据、密文检查点和恢复数据的数量与占用")
+    a.set_defaults(func=cmd_cache_status)
+    a.add_argument("project", nargs="?")
+    a.add_argument("--json", action="store_true")
+    a = css.add_parser("prune", help="清理本机缓存；默认 --dry-run 只预览，--apply 在本机锁内重新计算后删除")
+    a.set_defaults(func=cmd_cache_prune)
+    a.add_argument("project", nargs="?")
+    mg = a.add_mutually_exclusive_group()
+    mg.add_argument("--dry-run", action="store_true", help="只列出可删除项、保留原因和预计释放空间（默认）")
+    mg.add_argument("--apply", action="store_true", help="在本机锁内重新计算引用后删除允许删除的本地缓存")
+    a.add_argument("--expect-plan", metavar="DIGEST", help="与 --apply 同用：计划摘要与预览不同就不删除")
+    a.add_argument("--json", action="store_true")
 
     sp = P("transcripts", "查阅或检索跨机归档的历史对话全文", cmd_transcripts)
     sp.add_argument("project", nargs="?")
@@ -1576,6 +2632,9 @@ def main(argv=None):
     except CliError as e:
         warn(e.message)
         return e.code
+    except devices.AmbiguousDeviceError as e:
+        warn(_format_candidates_msg(str(e), e.candidates))
+        return 1
     except LookupError as e:
         warn(e.args[0] if e.args else str(e))
         return 1

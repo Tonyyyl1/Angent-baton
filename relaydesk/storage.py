@@ -11,6 +11,7 @@ import abc
 import hashlib
 import json
 import os
+import random
 import shutil
 import subprocess
 import tempfile
@@ -795,6 +796,129 @@ class LocalDirProvider(StorageProvider):
             except OSError:
                 break
         return True
+
+
+# ---------------------------------------------------------------- bounded retry for idempotent reads (fix H)
+
+def is_transient_error(exc: BaseException) -> bool:
+    """True only for a storage failure that a later identical read may not hit (network, timeout, 5xx).
+
+    Never transient: a not-found answer (``ObjectNotFoundError`` is a verified
+    absence, not a failed request), configuration, authorization, invalid-key
+    and local permission failures, and anything that is not a ``StorageError``
+    (signature and digest failures are raised by callers, after a read).
+    """
+    if not isinstance(exc, StorageError) or isinstance(exc, ObjectNotFoundError):
+        return False
+    try:
+        from . import sync_runtime as _SR
+    except ImportError:  # pragma: no cover - module imported outside the package
+        return False
+    return _SR.classify_error(exc).error_class == _SR.TRANSIENT
+
+
+class _WallClock(object):
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(max(0.0, float(seconds)))
+
+
+class RetryPolicy(object):
+    """At most ``attempts`` tries within ``deadline`` seconds, with capped exponential backoff and equal jitter.
+
+    The wait before try ``n + 1`` lies in ``[raw / 2, raw]`` with
+    ``raw = min(max_delay, base_delay * 2 ** (n - 1))``. No new try starts when
+    its wait would end after the deadline (counted from the first try), so a
+    slow failing call (an rclone timeout) is not repeated. ``clock`` needs
+    ``monotonic()`` and ``sleep(seconds)``; tests pass a fake clock.
+    """
+
+    def __init__(self, attempts: int = 4, base_delay: float = 0.5, max_delay: float = 4.0,
+                 deadline: float = 12.0, clock: Any = None, rng: Optional[random.Random] = None) -> None:
+        self.attempts = max(1, int(attempts))
+        self.base_delay = max(0.0, float(base_delay))
+        self.max_delay = max(self.base_delay, float(max_delay))
+        self.deadline = max(0.0, float(deadline))
+        self.clock = clock if clock is not None else _WallClock()
+        self.rng = rng if rng is not None else random.Random()
+        self.retries = 0   # waits taken so far (all calls), for diagnostics
+
+    def delay(self, attempt: int) -> float:
+        raw = min(self.max_delay, self.base_delay * (2.0 ** max(0, int(attempt) - 1)))
+        return raw / 2.0 + self.rng.random() * raw / 2.0
+
+    def call(self, fn, retry_if=None):
+        """``fn()``; after a transient failure wait and try again while attempts and the deadline allow."""
+        retry_if = retry_if or is_transient_error
+        started = self.clock.monotonic()
+        attempt = 1
+        while True:
+            try:
+                return fn()
+            except Exception as exc:
+                if attempt >= self.attempts or not retry_if(exc):
+                    raise
+                wait = self.delay(attempt)
+                if self.clock.monotonic() - started + wait > self.deadline:
+                    raise
+            self.retries += 1
+            self.clock.sleep(wait)
+            attempt += 1
+
+
+# Default for commands (publish, send, receive, inbox, recover, status, pair): about 1.75-3.5 s
+# of waiting before a read gives up. ``relay sync`` rounds do not retry in the round; they back
+# off between rounds (Phase B) and keep the workspace lock short.
+READ_RETRY = RetryPolicy()
+
+
+class RetryingProvider(StorageProvider):
+    """Retries the idempotent reads (``list_objects``, ``stat``, ``download``) of another provider.
+
+    Writes are passed through once: ``upload`` and ``delete`` are never retried
+    here. Callers that write immutable objects retry only after a read shows
+    the key absent or holding exactly their bytes (``retry_policy`` is exposed
+    for that). Every other attribute is the wrapped provider's.
+    """
+
+    def __init__(self, inner: Any, policy: Optional[RetryPolicy] = None) -> None:
+        self.inner = inner
+        self.retry_policy = policy if policy is not None else READ_RETRY
+
+    def __getattr__(self, name: str) -> Any:
+        if name in ("inner", "retry_policy"):
+            raise AttributeError(name)
+        return getattr(self.inner, name)
+
+    def list_objects(self, prefix: str = "") -> List[ObjectInfo]:
+        return self.retry_policy.call(lambda: self.inner.list_objects(prefix))
+
+    def stat(self, remote_key: str) -> Optional[ObjectInfo]:
+        return self.retry_policy.call(lambda: self.inner.stat(remote_key))
+
+    def download(self, remote_key: str, local_path: str) -> ObjectInfo:
+        # A download writes a temporary file and replaces ``local_path`` atomically: safe to repeat.
+        return self.retry_policy.call(lambda: self.inner.download(remote_key, local_path))
+
+    def upload(self, local_path: str, remote_key: str) -> ObjectInfo:
+        return self.inner.upload(local_path, remote_key)
+
+    def delete(self, remote_key: str) -> bool:
+        return self.inner.delete(remote_key)
+
+
+def with_read_retry(provider: Any, policy: Optional[RetryPolicy] = None) -> Any:
+    """``provider`` with bounded read retries (``READ_RETRY`` unless ``policy``); never wrapped twice."""
+    if provider is None or isinstance(provider, RetryingProvider):
+        return provider
+    return RetryingProvider(provider, policy if policy is not None else READ_RETRY)
+
+
+def without_retry(provider: Any) -> Any:
+    """The provider underneath a :class:`RetryingProvider` (or ``provider`` itself)."""
+    return provider.inner if isinstance(provider, RetryingProvider) else provider
 
 
 def make_provider(cloud_cfg: Dict[str, Any]) -> StorageProvider:
